@@ -1,12 +1,9 @@
 from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
-from app.adapters.manifest_loader import load_action_manifest, load_action_manifests
-from app.services.action_registry import ActionRegistry
+from forge_gateway.adapters.manifest_loader import load_action_manifest, load_action_manifests
+from forge_gateway.services.action_registry import ActionRegistry
 
 
 def _write_manifest(path: Path, *, action_name: str = "grasp", robot_id: str = "piper") -> None:

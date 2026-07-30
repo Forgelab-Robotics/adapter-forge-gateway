@@ -6,7 +6,7 @@ import queue
 from pathlib import Path
 from typing import Any
 
-from app.domain.commands import Command
+from forge_gateway.domain.commands import Command
 
 
 class CommandService:

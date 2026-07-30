@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.domain.action_manifest import ActionDefinition, ActionManifest
+from forge_gateway.domain.action_manifest import ActionDefinition, ActionManifest
 
 
 class ActionRegistry:

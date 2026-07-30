@@ -2,16 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import threading
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
-from app.controllers.record_controller import register_record_routes  # noqa: E402
+from forge_gateway.controllers.record_controller import register_record_routes
 
 
 class FakeRuntime:

@@ -1,6 +1,6 @@
 # Gateway node example config.
 # Run with:
-#   python main.py --config config.example.yaml
+#   gateway --config config.example.yaml
 #
 # Gateway 将 Dora 中的机器人状态、动作和图像转为 HTTP/WebSocket 接口。
 # 频率字段会被限制在 0.1-120 Hz，JPEG 质量范围为 1-100。
@@ -54,10 +54,10 @@ agent:
   write_context_snapshot: true  # 配置 state_dir 后，是否写 runtime_context.json 快照。
 
   # PAOS Agent 高层 action manifest。
-  # - 路径推荐为 ./actions/{robot_id}/{policy_id}.md。
-  # - 相对路径按本配置文件所在目录解析。
+  # - 未配置 action_manifests 时，Gateway 加载 wheel/可执行文件内置的 piper/sam3.md。
+  # - 如需外部 manifest，路径推荐为 ./actions/{robot_id}/{policy_id}.md。
+  # - 外部相对路径按本配置文件所在目录解析，不按进程工作目录解析。
   # - Gateway 只解析 Markdown YAML frontmatter；正文用于 Agent/人类阅读。
-  # - 未显式配置时，Gateway 会尝试加载内置 actions/piper/sam3.md。
   # - MVP+ 中不同 policy 可以同时存在于 dataflow，但 Gateway 只允许同一 robot 串行执行 action。
-  action_manifests:
-    - ./actions/piper/sam3.md
+  # action_manifests:
+  #   - ./actions/piper/sam3.md

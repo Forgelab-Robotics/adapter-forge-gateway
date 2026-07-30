@@ -19,8 +19,8 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
-from app.domain.commands import Command
-from app.domain.node_status import NodeStatus
+from forge_gateway.domain.commands import Command
+from forge_gateway.domain.node_status import NodeStatus
 
 logger = get_logger(__name__)
 

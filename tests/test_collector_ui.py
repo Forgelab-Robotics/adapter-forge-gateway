@@ -1,14 +1,11 @@
 import re
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
 TestClient = pytest.importorskip("fastapi.testclient").TestClient
 
-from app.adapters.http_app import STATIC_DIR, create_app
+from forge_gateway.adapters.http_app import STATIC_DIR, create_app
 
 
 class FakeRuntime:
@@ -57,5 +54,6 @@ def test_pyinstaller_bundle_includes_collector_ui_assets() -> None:
     spec_path = Path(__file__).parents[1] / "scripts" / "gateway.spec"
     spec = spec_path.read_text(encoding="utf-8")
 
-    assert '_static_dir = os.path.join(_node_dir, "app", "static")' in spec
-    assert '(_static_dir, os.path.join("app", "static"))' in spec
+    assert '_entry = os.path.join(_src_dir, "forge_gateway", "__main__.py")' in spec
+    assert '_resources_dir = os.path.join(_src_dir, "forge_gateway", "resources")' in spec
+    assert '(_resources_dir, os.path.join("forge_gateway", "resources"))' in spec

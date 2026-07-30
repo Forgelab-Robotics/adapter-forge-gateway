@@ -21,10 +21,10 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
-from config import load_config
-from app.adapters.dora_adapter import DoraEventBuffer, drain_commands, handle_dora_input
-from app.adapters.http_app import create_app
-from app.services.runtime_service import GatewayRuntime
+from forge_gateway.adapters.dora_adapter import DoraEventBuffer, drain_commands, handle_dora_input
+from forge_gateway.adapters.http_app import create_app
+from forge_gateway.config import load_config
+from forge_gateway.services.runtime_service import GatewayRuntime
 
 logger = get_logger(__name__)
 

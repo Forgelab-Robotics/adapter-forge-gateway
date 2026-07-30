@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.services.action_registry import ActionRegistry
+from forge_gateway.services.action_registry import ActionRegistry
 
 
 class CapabilityService:

@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
-from app.adapters.websocket import StalledWebSocketClient, send_json_with_timeout, sleep
+from forge_gateway.adapters.websocket import StalledWebSocketClient, send_json_with_timeout, sleep
 
 logger = get_logger(__name__)
 

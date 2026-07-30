@@ -1,12 +1,9 @@
 from pathlib import Path
-import sys
 
 import pytest
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
-from config import GatewayConfig, load_config
+from forge_gateway.config import GatewayConfig, load_config
 
 
 def test_config_parses_readiness(tmp_path: Path) -> None:

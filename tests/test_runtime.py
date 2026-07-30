@@ -1,4 +1,3 @@
-import importlib
 import json
 import sys
 import threading
@@ -7,13 +6,13 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
 pytest.importorskip("fastapi")
 pytest.importorskip("uvicorn")
 
-main = importlib.import_module("main")
-config = importlib.import_module("config")
+from forge_gateway import cli, config
+from forge_gateway.adapters.dora_adapter import DoraEventBuffer, drain_commands, handle_dora_input
+from forge_gateway.services import image_service
+from forge_gateway.services.runtime_service import GatewayRuntime
 
 
 class FakeNode:
@@ -36,7 +35,7 @@ def test_readiness_reports_missing_inputs() -> None:
             },
         }
     )
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         readiness = runtime.readiness()
 
@@ -58,7 +57,7 @@ def test_readiness_passes_when_required_signals_arrive() -> None:
             },
         }
     )
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         now = time.time()
         with runtime.lock:
@@ -80,7 +79,7 @@ def test_latest_image_updates_since_returns_only_current_payload() -> None:
             "image_input_ids": ["image/front"],
         }
     )
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         cursors: dict[str, int] = {}
 
@@ -98,7 +97,7 @@ def test_latest_image_updates_since_returns_only_current_payload() -> None:
 
 
 def test_dora_event_buffer_coalesces_input_events() -> None:
-    buffer = main.DoraEventBuffer()
+    buffer = DoraEventBuffer()
     buffer.put({"type": "INPUT", "id": "image/front", "value": "old"})
     buffer.put({"type": "INPUT", "id": "image/front", "value": "new"})
     buffer.put({"type": "INPUT", "id": "proprio_state", "value": "state"})
@@ -109,7 +108,7 @@ def test_dora_event_buffer_coalesces_input_events() -> None:
 
 
 def test_dora_event_buffer_preserves_control_events() -> None:
-    buffer = main.DoraEventBuffer()
+    buffer = DoraEventBuffer()
     stop_event = {"type": "STOP"}
     buffer.put({"type": "INPUT", "id": "image/front", "value": "frame"})
     buffer.put(stop_event)
@@ -119,7 +118,7 @@ def test_dora_event_buffer_preserves_control_events() -> None:
 
 
 def test_dora_event_buffer_counts_ticks_without_payload_buildup() -> None:
-    buffer = main.DoraEventBuffer()
+    buffer = DoraEventBuffer()
     buffer.put({"type": "INPUT", "id": "tick", "value": "a"})
     buffer.put({"type": "INPUT", "id": "tick", "value": "b"})
 
@@ -146,14 +145,14 @@ def test_image_encode_worker_keeps_latest_pending_frame(monkeypatch: pytest.Monk
             "data": str(value),
         }
 
-    monkeypatch.setattr(main, "_image_payload", fake_image_payload)
+    monkeypatch.setattr(image_service, "_image_payload", fake_image_payload)
     cfg = config.GatewayConfig.from_dict(
         {
             "joint_order": ["j1"],
             "image_input_ids": ["image/front"],
         }
     )
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         runtime.image_encoder.submit("image/front", "old", 1.0)
         assert first_encode_started.wait(timeout=2.0)
@@ -185,7 +184,7 @@ def test_agent_session_dispatches_policy_command_with_request_id(tmp_path: Path)
             "agent": {"state_dir": str(tmp_path)},
         }
     )
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         status_code, response = runtime.create_agent_session(
             {
@@ -200,7 +199,7 @@ def test_agent_session_dispatches_policy_command_with_request_id(tmp_path: Path)
         assert status_code == 202
         assert response["data"]["session"]["status"] == "queued"
         node = FakeNode()
-        main.drain_commands(runtime, node)
+        drain_commands(runtime, node)
 
         assert len(node.outputs) == 1
         output_id, value = node.outputs[0]
@@ -230,7 +229,7 @@ def test_policy_command_status_updates_agent_session(tmp_path: Path) -> None:
             "agent": {"state_dir": str(tmp_path)},
         }
     )
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         status_code, _ = runtime.create_agent_session(
             {
@@ -242,7 +241,7 @@ def test_policy_command_status_updates_agent_session(tmp_path: Path) -> None:
         )
         assert status_code == 202
         node = FakeNode()
-        main.drain_commands(runtime, node)
+        drain_commands(runtime, node)
 
         status = forge_msgs.PolicyCommandStatus.from_outputs(
             policy_id="sam3",
@@ -251,7 +250,7 @@ def test_policy_command_status_updates_agent_session(tmp_path: Path) -> None:
             status="done",
             outputs={"accepted": True, "command_id": "command-2"},
         )
-        main.handle_dora_input(runtime, "policy_command_status", status.to_arrow())
+        handle_dora_input(runtime, "policy_command_status", status.to_arrow())
 
         session_status, session_response = runtime.get_agent_session("session-2")
         assert session_status == 200
@@ -269,7 +268,7 @@ def test_policy_command_status_updates_agent_session(tmp_path: Path) -> None:
 
 def test_agent_session_rejects_unknown_action() -> None:
     cfg = config.GatewayConfig.from_dict({"joint_order": ["j1"]})
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         status_code, response = runtime.create_agent_session(
             {
@@ -293,14 +292,14 @@ def test_agent_session_rejects_unknown_action() -> None:
 def test_agent_runtime_reset_sends_reset_scene_command() -> None:
     forge_msgs = pytest.importorskip("forge_msgs")
     cfg = config.GatewayConfig.from_dict({"joint_order": ["j1"]})
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         status_code, response = runtime.agent_runtime_reset({"inputs": {"reason": "paos-agent"}})
 
         assert status_code == 202
         assert response["data"]["command"] == "reset_scene"
         node = FakeNode()
-        main.drain_commands(runtime, node)
+        drain_commands(runtime, node)
 
         assert len(node.outputs) == 1
         reset_msg = forge_msgs.PolicyCommand.from_arrow(node.outputs[0][1])
@@ -312,7 +311,7 @@ def test_agent_runtime_reset_sends_reset_scene_command() -> None:
 
 def test_agent_runtime_context_exposes_capabilities() -> None:
     cfg = config.GatewayConfig.from_dict({"joint_order": ["j1"]})
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         context = runtime.agent_runtime_context()
 
@@ -330,7 +329,7 @@ def test_agent_runtime_context_exposes_capabilities() -> None:
 def test_cancel_agent_session_sends_policy_stop() -> None:
     forge_msgs = pytest.importorskip("forge_msgs")
     cfg = config.GatewayConfig.from_dict({"joint_order": ["j1"]})
-    runtime = main.GatewayRuntime(cfg)
+    runtime = GatewayRuntime(cfg)
     try:
         status_code, _ = runtime.create_agent_session(
             {
@@ -342,12 +341,12 @@ def test_cancel_agent_session_sends_policy_stop() -> None:
         )
         assert status_code == 202
         node = FakeNode()
-        main.drain_commands(runtime, node)
+        drain_commands(runtime, node)
 
         cancel_status, cancel_response = runtime.cancel_agent_session("session-cancel")
         assert cancel_status == 200
         assert cancel_response["data"]["status"] == "cancelled"
-        main.drain_commands(runtime, node)
+        drain_commands(runtime, node)
 
         assert len(node.outputs) == 2
         stop_msg = forge_msgs.PolicyCommand.from_arrow(node.outputs[1][1])
@@ -374,7 +373,7 @@ def test_main_print_capabilities_without_joint_order(
         ["gateway", "--config", str(config_path), "--print-capabilities"],
     )
 
-    assert main.main() == 0
+    assert cli.main() == 0
 
     capabilities = json.loads(capsys.readouterr().out)
     assert capabilities["supports"]["cancel"] is True

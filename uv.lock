@@ -128,7 +128,7 @@ source = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git?subdirect
 [[package]]
 name = "forge-gateway"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "dora-rs" },
     { name = "fastapi" },

@@ -11,15 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.controllers.agent_controller import register_agent_routes
-from app.controllers.playback_controller import register_playback_routes
-from app.controllers.policy_controller import register_policy_routes
-from app.controllers.record_controller import register_record_routes
-from app.controllers.runtime_controller import register_runtime_routes
-from app.controllers.websocket_controller import register_websocket_routes
+from forge_gateway.controllers.agent_controller import register_agent_routes
+from forge_gateway.controllers.playback_controller import register_playback_routes
+from forge_gateway.controllers.policy_controller import register_policy_routes
+from forge_gateway.controllers.record_controller import register_record_routes
+from forge_gateway.controllers.runtime_controller import register_runtime_routes
+from forge_gateway.controllers.websocket_controller import register_websocket_routes
 
 
-STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
+STATIC_DIR = Path(__file__).resolve().parents[1] / "resources" / "static"
 
 
 def create_app(runtime: Any, stop_event: threading.Event | None = None) -> FastAPI:

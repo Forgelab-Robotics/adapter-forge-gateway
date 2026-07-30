@@ -5,13 +5,13 @@ import os
 from PyInstaller.utils.hooks import collect_submodules
 
 _spec_dir = os.path.dirname(os.path.abspath(SPEC))
-_node_dir = os.path.dirname(_spec_dir)
-_actions_dir = os.path.join(_node_dir, "actions")
-_static_dir = os.path.join(_node_dir, "app", "static")
-_sam3_manifest = os.path.join(_actions_dir, "piper", "sam3.md")
+_root_dir = os.path.dirname(_spec_dir)
+_src_dir = os.path.join(_root_dir, "src")
+_entry = os.path.join(_src_dir, "forge_gateway", "__main__.py")
+_resources_dir = os.path.join(_src_dir, "forge_gateway", "resources")
 
 hiddenimports = (
-    collect_submodules("app")
+    collect_submodules("forge_gateway")
     + collect_submodules("uvicorn")
     + collect_submodules("fastapi")
     + collect_submodules("forge_msgs")
@@ -23,12 +23,11 @@ hiddenimports = (
 )
 
 a = Analysis(
-    [os.path.join(_node_dir, "main.py")],
-    pathex=[_node_dir],
+    [_entry],
+    pathex=[_src_dir],
     binaries=[],
     datas=[
-        (_sam3_manifest, os.path.join("actions", "piper")),
-        (_static_dir, os.path.join("app", "static")),
+        (_resources_dir, os.path.join("forge_gateway", "resources")),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],

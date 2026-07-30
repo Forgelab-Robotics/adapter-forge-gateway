@@ -2,27 +2,17 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from app.domain.action_manifest import ActionDefinition, ActionManifest
+from forge_gateway.domain.action_manifest import ActionDefinition, ActionManifest
 
 
 def default_action_manifests() -> list[Path]:
-    candidates: list[Path] = []
-    bundle_root = getattr(sys, "_MEIPASS", None)
-    if bundle_root:
-        candidates.append(Path(bundle_root) / "actions" / "piper" / "sam3.md")
-    candidates.append(Path(__file__).resolve().parents[2] / "actions" / "piper" / "sam3.md")
-    candidates.append(Path.cwd() / "packages" / "nodes" / "gateway" / "actions" / "piper" / "sam3.md")
-    candidates.append(Path.cwd() / "actions" / "piper" / "sam3.md")
-    for path in candidates:
-        if path.is_file():
-            return [path]
-    return []
+    path = Path(__file__).resolve().parents[1] / "resources" / "actions" / "piper" / "sam3.md"
+    return [path] if path.is_file() else []
 
 
 def resolve_path(path: Path, base_dir: Path | None) -> Path:

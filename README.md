@@ -25,8 +25,17 @@ uv run pytest -q
 从源码启动：
 
 ```bash
-uv run python main.py --config config.example.yaml
+uv run gateway --config config.example.yaml
 ```
+
+包入口与 console 入口等价，可分别检查帮助信息：
+
+```bash
+uv run python -m forge_gateway --help
+uv run gateway --help
+```
+
+根目录的 `main.py` 与 `config.py` 仅作为源码 checkout 的兼容 shim；wheel 只安装 `forge_gateway` package。
 
 构建独立可执行文件：
 
@@ -58,10 +67,12 @@ readiness:
   image_stale_after_sec: 2.0
 ```
 
+未配置 `agent.action_manifests` 时，Gateway 会加载 package 内置的 `piper/sam3.md`，无需复制资源或依赖当前工作目录。显式配置外部 manifest 时，相对路径仍按 YAML 配置文件所在目录解析。
+
 启动：
 
 ```bash
-uv run python main.py --config gateway.yaml
+uv run gateway --config gateway.yaml
 ```
 
 ## 数据采集面板
@@ -78,7 +89,7 @@ uv run python main.py --config gateway.yaml
 打印当前配置支持的 Agent/runtime 接口（不启动 Dora/HTTP）：
 
 ```bash
-uv run python main.py --config gateway.yaml --print-capabilities
+uv run gateway --config gateway.yaml --print-capabilities
 ```
 
 ## HTTP API

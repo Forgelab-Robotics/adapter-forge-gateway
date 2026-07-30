@@ -18,14 +18,14 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
-from config import GatewayConfig
-from app.adapters.state_files import StateFileStore
-from app.domain.commands import Command, CommandState, map_policy_status
-from app.domain.node_status import NodeStatus
-from app.domain.sessions import SessionState, session_status_from_command
-from app.services.action_registry import ActionRegistry
-from app.services.capability_service import CapabilityService
-from app.services.image_service import ImageEncodeWorker
+from forge_gateway.adapters.state_files import StateFileStore
+from forge_gateway.config import GatewayConfig
+from forge_gateway.domain.commands import Command, CommandState, map_policy_status
+from forge_gateway.domain.node_status import NodeStatus
+from forge_gateway.domain.sessions import SessionState, session_status_from_command
+from forge_gateway.services.action_registry import ActionRegistry
+from forge_gateway.services.capability_service import CapabilityService
+from forge_gateway.services.image_service import ImageEncodeWorker
 
 logger = get_logger(__name__)
 

@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.controllers.utils import json_response, read_json
+from forge_gateway.controllers.utils import json_response, read_json
 
 
 def register_policy_routes(app: FastAPI, runtime: Any) -> None:
