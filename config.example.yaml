@@ -1,0 +1,63 @@
+# Gateway node example config.
+# Run with:
+#   python main.py --config config.example.yaml
+#
+# Gateway 将 Dora 中的机器人状态、动作和图像转为 HTTP/WebSocket 接口。
+# 频率字段会被限制在 0.1-120 Hz，JPEG 质量范围为 1-100。
+
+host: 127.0.0.1  # 监听地址；127.0.0.1 仅本机访问，0.0.0.0 允许局域网访问。
+port: 9001       # HTTP/WebSocket 端口；需避免与其他服务冲突。
+
+# Display/order filter for JointState and JointCommand values.
+# 顺序必须与 task_robot 输出的 JointState/JointCommand 向量一致。
+joint_order:
+  - joint1
+  - joint2
+  - joint3
+  - joint4
+  - joint5
+  - joint6
+  - gripper
+
+# Dora input ids for image streams.
+# 这些 id 必须与 dataflow.yaml 中 gateway.inputs 的图像键一致。
+image_input_ids:
+  - image/wrist
+  - image/top
+
+state_broadcast_hz: 50    # 状态推送频率 (Hz)，默认 50，运行时限制为 0.1-120。
+image_broadcast_hz: 24    # 图像推送频率 (Hz)，默认 24，运行时限制为 0.1-120。
+ws_send_timeout_sec: 1.0  # WebSocket 单次发送超时 (秒)，最小 0.1。
+jpeg_quality: 85          # Web 端图像 JPEG 质量，范围 1-100。
+policy_id: default        # 展示/控制使用的策略标识，通常保持 default。
+
+readiness:
+  require_proprio_state: true   # true 时，收到本体状态后才允许 /runtime/start 生效。
+  require_images: true          # true 时，所有 image_input_ids 都收到新图像后才允许启动。
+  require_state_client: false   # true 时，必须有状态 WebSocket 客户端连接后才允许启动。
+  require_image_client: false   # true 时，必须有图像 WebSocket 客户端连接后才允许启动。
+  image_stale_after_sec: 2.0    # 图像超过该秒数未更新则视为未就绪，最小 0.1。
+
+# PAOS Agent-facing Gateway MVP+ 配置。
+# 该段用于新增 /agent/* API，不影响既有 /policy/command、/runtime/start、
+# record/playback 和 WebSocket 链路。
+agent:
+  enabled: true                 # true 时启用 /agent/sessions 与 /agent/runtime/* API。
+
+  # 状态持久化目录。
+  # - null 或不配置：仅使用内存状态，不写文件，适合保持旧部署零副作用。
+  # - 配置路径：Gateway 会追加 gateway_events.jsonl，并写 runtime_context.json 快照。
+  # state_dir: /tmp/paos_forge_gateway_state
+
+  command_timeout_sec: 120.0    # 预留给 Watchdog MVP+ 的命令超时配置，最小 1 秒。
+  max_active_sessions: 1        # MVP+ 强制串行动作；该值会被 Gateway 固定为 1，不用于开启并行。
+  write_context_snapshot: true  # 配置 state_dir 后，是否写 runtime_context.json 快照。
+
+  # PAOS Agent 高层 action manifest。
+  # - 路径推荐为 ./actions/{robot_id}/{policy_id}.md。
+  # - 相对路径按本配置文件所在目录解析。
+  # - Gateway 只解析 Markdown YAML frontmatter；正文用于 Agent/人类阅读。
+  # - 未显式配置时，Gateway 会尝试加载内置 actions/piper/sam3.md。
+  # - MVP+ 中不同 policy 可以同时存在于 dataflow，但 Gateway 只允许同一 robot 串行执行 action。
+  action_manifests:
+    - ./actions/piper/sam3.md

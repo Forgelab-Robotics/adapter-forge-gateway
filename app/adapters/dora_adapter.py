@@ -1,0 +1,187 @@
+"""Dora node adapter."""
+
+from __future__ import annotations
+
+import json
+import queue
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+try:
+    from forge_common import get_logger
+except Exception:  # pragma: no cover - fallback for minimal test envs
+    import logging
+
+    def get_logger(name: str) -> logging.Logger:
+        logging.basicConfig(level=logging.INFO)
+        return logging.getLogger(name)
+
+from app.domain.commands import Command
+from app.domain.node_status import NodeStatus
+
+logger = get_logger(__name__)
+
+class DoraEventBuffer:
+    """Coalesce high-rate Dora input events so stale images cannot accumulate."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._events: deque[Any] = deque()
+        self._input_order: deque[str] = deque()
+        self._latest_inputs: dict[str, Any] = {}
+        self._pending_ticks = 0
+
+    def put(self, event: Any) -> None:
+        with self._condition:
+            if isinstance(event, dict) and event.get("type") == "INPUT":
+                input_id = str(event.get("id"))
+                if input_id == "tick":
+                    self._pending_ticks += 1
+                elif input_id not in self._latest_inputs:
+                    self._input_order.append(input_id)
+                    self._latest_inputs[input_id] = event
+                else:
+                    self._latest_inputs[input_id] = event
+            else:
+                self._events.append(event)
+            self._condition.notify()
+
+    def get(self, timeout: float) -> Any | None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not self._events and not self._input_order and self._pending_ticks == 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(timeout=remaining)
+
+            if self._events:
+                return self._events.popleft()
+
+            if self._pending_ticks > 0:
+                self._pending_ticks -= 1
+                return {"type": "INPUT", "id": "tick", "value": None}
+
+            input_id = self._input_order.popleft()
+            return self._latest_inputs.pop(input_id)
+
+def _joint_values_by_name(msg: Any) -> dict[str, float]:
+    for field in ("position", "velocity", "effort"):
+        values = getattr(msg, field)
+        if values:
+            return dict(zip(msg.name, values, strict=True))
+    return {name: 0.0 for name in msg.name}
+
+
+def _ordered(values: dict[str, float], joint_order: list[str]) -> dict[str, float]:
+    if not joint_order:
+        return values
+    return {name: values[name] for name in joint_order if name in values}
+
+
+def handle_dora_input(runtime: GatewayRuntime, input_id: str, value: object) -> None:
+    from forge_msgs import JointCommand, JointState
+
+    now = time.time()
+    if input_id == "tick":
+        with runtime.lock:
+            runtime.current_frame_count += 1
+        return
+
+    if input_id == "proprio_state":
+        joint_state = JointState.from_arrow(value)  # type: ignore[arg-type]
+        joints = _ordered(_joint_values_by_name(joint_state), runtime.config.joint_order)
+        with runtime.lock:
+            runtime.proprio_state = joints
+            runtime.latest_proprio_time = now
+            runtime.nodes["proprio_state"] = NodeStatus("proprio_state", "ready", now, {"joint_count": len(joints)})
+        return
+
+    if input_id == "action":
+        command = JointCommand.from_arrow(value)  # type: ignore[arg-type]
+        action = _ordered(_joint_values_by_name(command), runtime.config.joint_order)
+        with runtime.lock:
+            runtime.action = action
+            runtime.latest_action_time = now
+            runtime.nodes["action"] = NodeStatus("action", "ready", now, {"joint_count": len(action)})
+        return
+
+    if input_id == "runtime_status":
+        payload = _json_bytes(value)
+        if isinstance(payload, dict):
+            with runtime.lock:
+                runtime.sim_status.update(payload)
+                runtime.nodes["runtime_status"] = NodeStatus("runtime_status", "ready", now, payload)
+        return
+
+    if input_id == "record_status":
+        payload = _json_bytes(value)
+        if isinstance(payload, dict):
+            with runtime.lock:
+                runtime.record_status.update(payload)
+                runtime.nodes["record_status"] = NodeStatus("record_status", "ready", now, payload)
+        return
+
+    if input_id == "playback_status":
+        payload = _json_bytes(value)
+        if isinstance(payload, dict):
+            with runtime.lock:
+                runtime.playback_status.update(payload)
+                runtime.nodes["playback_status"] = NodeStatus("playback_status", "ready", now, payload)
+        return
+
+    if input_id == "policy_command_status":
+        runtime.apply_policy_command_status(value)
+        return
+
+    if input_id in runtime.config.image_input_ids:
+        runtime.image_encoder.submit(input_id, value, now)
+
+
+def _json_bytes(value: object) -> Any:
+    try:
+        return json.loads(bytes(value).decode("utf-8"))  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def handle_command(runtime: GatewayRuntime, node: Any, cmd: Command) -> None:
+    if cmd.kind == "SET_ROOT":
+        raw_root = cmd.payload.get("root")
+        with runtime.lock:
+            runtime.record_root = Path(raw_root) if isinstance(raw_root, str) and raw_root else None
+        return
+
+    command = str(cmd.payload["command"])
+    inputs = dict(cmd.payload.get("inputs") or {})
+    policy_id = str(cmd.payload.get("policy_id") or runtime.config.policy_id)
+    if command == "start_recording" and not inputs.get("output_path"):
+        with runtime.lock:
+            root = runtime.record_root
+        inputs["output_path"] = str(root / "recording.mcap") if root is not None else "recording.mcap"
+
+    from forge_msgs import PolicyCommand
+
+    request_id = str(cmd.payload.get("request_id") or "")
+    logger.info("gateway: send policy_command policy_id=%s command=%s inputs=%s", policy_id, command, inputs)
+    msg = PolicyCommand.from_inputs(
+        policy_id=policy_id,
+        command=command,
+        inputs=inputs,
+        request_id=request_id,
+    )
+    node.send_output("policy_command", msg.to_arrow())
+    runtime.mark_command_sent(request_id)
+
+
+def drain_commands(runtime: GatewayRuntime, node: Any) -> None:
+    while True:
+        try:
+            cmd = runtime.command_queue.get_nowait()
+        except queue.Empty:
+            return
+        handle_command(runtime, node, cmd)
+

@@ -1,0 +1,31 @@
+[project]
+name = "forge-gateway"
+version = "0.1.0"
+description = "Unified Forge runtime gateway: HTTP control API, runtime readiness gate, and WebSocket viewer"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "dora-rs==0.4.1",
+    "fastapi",
+    "uvicorn[standard]",
+    "forge-msgs",
+    "forge-common",
+    "opencv-python",
+    "pyyaml",
+]
+
+[dependency-groups]
+dev = [
+    "httpx",
+    "pytest",
+]
+build = [
+    "pyinstaller",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv.sources]
+forge-msgs = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git", rev = "9f4203dc05b156a238f91f72b7cb28e8fce7fca9", subdirectory = "packages/msgs" }
+forge-common = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git", rev = "9f4203dc05b156a238f91f72b7cb28e8fce7fca9", subdirectory = "packages/common" }
