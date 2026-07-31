@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 try:
     from forge_common import get_logger
@@ -34,6 +35,16 @@ from forge_gateway.services.image_service import ImageEncodeWorker
 
 logger = get_logger(__name__)
 
+RuntimePhase = Literal["running", "closing", "closed"]
+
+
+@dataclass
+class _CloseAttempt:
+    completed: threading.Event = field(default_factory=threading.Event)
+    succeeded: bool | None = None
+    error: BaseException | None = None
+
+
 class GatewayRuntime:
     """Thread-safe shared runtime state for FastAPI and Dora loops."""
 
@@ -46,6 +57,12 @@ class GatewayRuntime:
             action_registry=self.action_registry,
         )
         self.lock = threading.Lock()
+        self._phase: RuntimePhase = "running"
+        self._dispatch_condition = threading.Condition(self.lock)
+        self._inflight_dispatches = 0
+        self._dispatch_close_timeout_sec = 2.0
+        self._close_in_progress = False
+        self._close_attempt: _CloseAttempt | None = None
         self.command_service = CommandService(
             default_policy_id=config.policy_id,
             capacity=config.command_queue_capacity,
@@ -98,6 +115,12 @@ class GatewayRuntime:
         return self.command_service.dispatch_blocked_reason
 
     @property
+    def phase(self) -> RuntimePhase:
+        with self.lock:
+            return self._phase
+
+
+    @property
     def sessions(self) -> dict[str, SessionState]:
         return self.agent_service.sessions
 
@@ -129,8 +152,6 @@ class GatewayRuntime:
     def last_result(self, value: dict[str, Any] | None) -> None:
         self.agent_service.last_result = value
 
-
-
     def enqueue_policy_command(
         self,
         command: str,
@@ -143,16 +164,21 @@ class GatewayRuntime:
         attempt: int = 0,
         safety: bool = False,
     ) -> None:
-        self.command_service.enqueue_policy_command(
-            command,
-            inputs,
-            request_id=request_id,
-            policy_id=policy_id,
-            tracked_command_id=tracked_command_id,
-            retry_on_failure=retry_on_failure,
-            attempt=attempt,
-            safety=safety,
-        )
+        with self.lock:
+            if self._phase != "running":
+                raise CommandMailboxUnavailable(
+                    f"gateway runtime is {self._phase}"
+                )
+            self.command_service.enqueue_policy_command(
+                command,
+                inputs,
+                request_id=request_id,
+                policy_id=policy_id,
+                tracked_command_id=tracked_command_id,
+                retry_on_failure=retry_on_failure,
+                attempt=attempt,
+                safety=safety,
+            )
 
     def enqueue_policy_command_if_ready(
         self,
@@ -161,6 +187,10 @@ class GatewayRuntime:
     ) -> tuple[bool, dict[str, Any]]:
         """Atomically recheck readiness and admit a runtime start command."""
         with self.lock:
+            if self._phase != "running":
+                raise CommandMailboxUnavailable(
+                    f"gateway runtime is {self._phase}"
+                )
             readiness = self._readiness_locked(time.time())
             if not readiness["ready"]:
                 return False, readiness
@@ -168,7 +198,12 @@ class GatewayRuntime:
             return True, readiness
 
     def set_record_root(self, root: str | None) -> None:
-        self.command_service.set_record_root(root)
+        with self.lock:
+            if self._phase != "running":
+                raise CommandMailboxUnavailable(
+                    f"gateway runtime is {self._phase}"
+                )
+            self.command_service.set_record_root(root)
 
     def take_next_command(self) -> Command | None:
         return self.command_service.take_next_command()
@@ -240,6 +275,11 @@ class GatewayRuntime:
         if not isinstance(prepared, PreparedSession):
             return prepared
         with self.lock:
+            if self._phase != "running":
+                return 503, {
+                    "ok": False,
+                    "msg": f"gateway runtime is {self._phase}",
+                }
             result, event = self.agent_service.create_session_locked(prepared)
             if event is not None:
                 self._persist_agent_event_locked(event)
@@ -252,6 +292,11 @@ class GatewayRuntime:
     def cancel_agent_session(self, session_id: str) -> tuple[int, dict[str, Any]]:
         now = time.time()
         with self.lock:
+            if self._phase != "running":
+                return 503, {
+                    "ok": False,
+                    "msg": f"gateway runtime is {self._phase}",
+                }
             result, event = self.agent_service.cancel_session_locked(
                 session_id,
                 now=now,
@@ -261,10 +306,23 @@ class GatewayRuntime:
         return result
 
     def claim_command_dispatch(self, command_id: str | None) -> bool:
-        if not command_id:
+        with self._dispatch_condition:
+            if self._phase != "running":
+                return False
+            if command_id and not self.agent_service.claim_command_dispatch_locked(
+                command_id
+            ):
+                return False
+            self._inflight_dispatches += 1
             return True
-        with self.lock:
-            return self.agent_service.claim_command_dispatch_locked(command_id)
+
+    def release_command_dispatch(self) -> None:
+        with self._dispatch_condition:
+            if self._inflight_dispatches < 1:
+                raise RuntimeError("command dispatch lease underflow")
+            self._inflight_dispatches -= 1
+            if self._inflight_dispatches == 0:
+                self._dispatch_condition.notify_all()
 
     def mark_command_sent(self, command_id: str) -> None:
         if not command_id:
@@ -312,6 +370,43 @@ class GatewayRuntime:
             )
             self._persist_agent_event_locked(event)
 
+    def publish_image_payload(
+        self,
+        input_id: str,
+        payload: dict[str, Any],
+        timestamp: float,
+    ) -> bool:
+        with self.lock:
+            return self._publish_image_payload_locked(input_id, payload, timestamp)
+
+    def _publish_image_payload_locked(
+        self,
+        input_id: str,
+        payload: dict[str, Any],
+        timestamp: float,
+    ) -> bool:
+        if self._phase != "running":
+            return False
+        payload["seq"] = self.next_image_seq
+        payload["timestamp"] = timestamp
+        self.next_image_seq += 1
+        self.images[input_id] = payload
+        return True
+
+    def report_image_encode_error(self, input_id: str, error: Exception) -> bool:
+        with self.lock:
+            return self._report_image_encode_error_locked(input_id, error)
+
+    def _report_image_encode_error_locked(
+        self,
+        input_id: str,
+        error: Exception,
+    ) -> bool:
+        if self._phase != "running":
+            return False
+        self.last_error = f"image worker {input_id} failed: {error}"
+        return True
+
     def latest_image_updates_since(self, cursors: dict[str, int]) -> list[dict[str, Any]]:
         """Return only the newest image payload per stream since each client cursor."""
         with self.lock:
@@ -331,10 +426,101 @@ class GatewayRuntime:
         with self.lock:
             return self._readiness_locked(time.time())
 
-    def close(self) -> None:
-        self.image_encoder.close()
+    def close(self) -> bool:
+        owner = False
         with self.lock:
-            self._write_snapshot_locked(time.time())
+            if self._phase == "closed":
+                return True
+            if self._close_in_progress:
+                attempt = self._close_attempt
+                if attempt is None:
+                    raise RuntimeError("gateway close attempt is missing")
+            else:
+                self.image_encoder.reject_submissions()
+                self._phase = "closing"
+                self._close_in_progress = True
+                attempt = _CloseAttempt()
+                self._close_attempt = attempt
+                owner = True
+
+        if not owner:
+            attempt.completed.wait()
+            return self._completed_close_result(attempt)
+
+        close_errors: list[BaseException] = []
+        try:
+            self.image_encoder.request_stop()
+        except BaseException as error:
+            close_errors.append(error)
+
+        try:
+            self.command_service.close(
+                "gateway runtime is not accepting commands"
+            )
+        except BaseException as error:
+            close_errors.append(error)
+
+        dispatch_drained = False
+        try:
+            deadline = time.monotonic() + self._dispatch_close_timeout_sec
+            with self._dispatch_condition:
+                while self._inflight_dispatches > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._dispatch_condition.wait(timeout=remaining)
+                dispatch_drained = self._inflight_dispatches == 0
+        except BaseException as error:
+            close_errors.append(error)
+
+        encoder_stopped = False
+        try:
+            encoder_stopped = self.image_encoder.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+        close_error = self._combine_close_errors(close_errors)
+        failure_reasons: list[str] = []
+        if not dispatch_drained:
+            failure_reasons.append("command dispatch did not stop before shutdown timeout")
+        if not encoder_stopped:
+            failure_reasons.append("image encoder did not stop before shutdown timeout")
+        if close_error is not None:
+            failure_reasons.append(f"gateway runtime close failed: {close_error}")
+
+        succeeded = dispatch_drained and encoder_stopped and close_error is None
+        with self.lock:
+            self._phase = "closed" if succeeded else "closing"
+            attempt.succeeded = succeeded
+            attempt.error = close_error
+            if failure_reasons:
+                self.last_error = "; ".join(failure_reasons)
+            try:
+                self._write_snapshot_locked(time.time())
+            except BaseException as error:
+                close_errors.append(error)
+                attempt.error = self._combine_close_errors(close_errors)
+                attempt.succeeded = False
+                self._phase = "closing"
+            finally:
+                self._close_in_progress = False
+                attempt.completed.set()
+
+        return self._completed_close_result(attempt)
+
+    @staticmethod
+    def _combine_close_errors(errors: list[BaseException]) -> BaseException | None:
+        if not errors:
+            return None
+        if len(errors) == 1:
+            return errors[0]
+        return BaseExceptionGroup("gateway runtime close failed", errors)
+
+    @staticmethod
+    def _completed_close_result(attempt: _CloseAttempt) -> bool:
+        if attempt.error is not None:
+            raise RuntimeError("gateway runtime close failed") from attempt.error
+        return bool(attempt.succeeded)
 
     def _state_snapshot_locked(self, now: float) -> dict[str, Any]:
         return {
@@ -345,6 +531,7 @@ class GatewayRuntime:
                 "command": dict(self.action),
             },
             "runtime": {
+                "phase": self._phase,
                 "sim_status": dict(self.sim_status),
                 "record_status": dict(self.record_status),
                 "playback_status": dict(self.playback_status),
@@ -356,6 +543,8 @@ class GatewayRuntime:
     def _readiness_locked(self, now: float) -> dict[str, Any]:
         cfg = self.config.readiness
         missing: list[str] = []
+        if self._phase != "running":
+            missing.append(f"runtime:{self._phase}")
 
         proprio_age = (
             None
@@ -411,6 +600,7 @@ class GatewayRuntime:
         return {
             "ready": not missing,
             "missing": missing,
+            "runtime_phase": self._phase,
             "proprio_state_ready": proprio_ready,
             "required_images_ready": images_ready,
             "images": image_status,
@@ -432,6 +622,7 @@ class GatewayRuntime:
             "last_result": dict(self.last_result or {}),
             "last_error": self.last_error,
             "runtime": {
+                "phase": self._phase,
                 "current_frame_count": self.current_frame_count,
                 "sim_status": dict(self.sim_status),
                 "record_status": dict(self.record_status),

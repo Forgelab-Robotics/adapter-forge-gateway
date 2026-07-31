@@ -215,6 +215,112 @@ def test_image_encode_worker_keeps_latest_pending_frame(monkeypatch: pytest.Monk
         runtime.close()
 
 
+def test_image_encode_worker_drops_superseded_inflight_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_started = threading.Event()
+    release_old = threading.Event()
+    new_started = threading.Event()
+    release_new = threading.Event()
+
+    def fake_image_payload(input_id: str, value: object, quality: int) -> dict[str, object]:
+        del quality
+        if value == "old":
+            old_started.set()
+            assert release_old.wait(timeout=2.0)
+        if value == "new":
+            new_started.set()
+            assert release_new.wait(timeout=2.0)
+        return {
+            "type": "image",
+            "id": input_id,
+            "format": "jpeg",
+            "content_type": "image/jpeg",
+            "data": str(value),
+        }
+
+    monkeypatch.setattr(image_service, "_image_payload", fake_image_payload)
+    runtime = GatewayRuntime(
+        config.GatewayConfig.from_dict(
+            {"joint_order": ["j1"], "image_input_ids": ["image/front"]}
+        )
+    )
+    try:
+        assert runtime.image_encoder.submit("image/front", "old", 1.0) is True
+        assert old_started.wait(timeout=1.0)
+        assert runtime.image_encoder.submit("image/front", "new", 2.0) is True
+        release_old.set()
+        assert new_started.wait(timeout=1.0)
+
+        with runtime.lock:
+            assert "image/front" not in runtime.images
+
+        release_new.set()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with runtime.lock:
+                latest = runtime.images.get("image/front")
+            if latest is not None:
+                break
+            time.sleep(0.01)
+
+        with runtime.lock:
+            assert runtime.images["image/front"]["data"] == "new"
+            assert runtime.images["image/front"]["timestamp"] == 2.0
+    finally:
+        release_old.set()
+        release_new.set()
+        runtime.close()
+
+
+def test_superseded_image_failure_does_not_replace_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_started = threading.Event()
+    release_old = threading.Event()
+
+    def fake_image_payload(input_id: str, value: object, quality: int) -> dict[str, object]:
+        del quality
+        if value == "old":
+            old_started.set()
+            assert release_old.wait(timeout=2.0)
+            raise RuntimeError("stale failure")
+        return {
+            "type": "image",
+            "id": input_id,
+            "format": "jpeg",
+            "content_type": "image/jpeg",
+            "data": str(value),
+        }
+
+    monkeypatch.setattr(image_service, "_image_payload", fake_image_payload)
+    runtime = GatewayRuntime(
+        config.GatewayConfig.from_dict(
+            {"joint_order": ["j1"], "image_input_ids": ["image/front"]}
+        )
+    )
+    try:
+        assert runtime.image_encoder.submit("image/front", "old", 1.0) is True
+        assert old_started.wait(timeout=1.0)
+        assert runtime.image_encoder.submit("image/front", "new", 2.0) is True
+        release_old.set()
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with runtime.lock:
+                latest = runtime.images.get("image/front")
+            if latest is not None:
+                break
+            time.sleep(0.01)
+
+        with runtime.lock:
+            assert runtime.images["image/front"]["data"] == "new"
+            assert runtime.last_error is None
+    finally:
+        release_old.set()
+        runtime.close()
+
+
 def test_agent_session_dispatches_policy_command_with_request_id(tmp_path: Path) -> None:
     forge_msgs = pytest.importorskip("forge_msgs")
     cfg = config.GatewayConfig.from_dict(

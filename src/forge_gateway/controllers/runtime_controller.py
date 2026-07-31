@@ -26,8 +26,18 @@ def register_runtime_routes(
     stop_event: threading.Event | None = None,
 ) -> None:
     @app.get("/health")
-    async def health() -> dict[str, Any]:
-        return {"ok": True, "msg": "gateway healthy"}
+    async def health() -> JSONResponse:
+        phase = getattr(runtime, "phase", "running")
+        if phase != "running":
+            return json_response(
+                503,
+                {
+                    "ok": False,
+                    "msg": f"gateway runtime is {phase}",
+                    "data": {"phase": phase},
+                },
+            )
+        return json_response(200, {"ok": True, "msg": "gateway healthy"})
 
     @app.get("/runtime/status")
     async def runtime_status() -> dict[str, Any]:
@@ -40,7 +50,20 @@ def register_runtime_routes(
             return body
         readiness = runtime.readiness()
         if not readiness["ready"]:
-            return json_response(409, {"ok": False, "msg": "runtime is not ready", "data": readiness})
+            phase = readiness.get("runtime_phase")
+            if phase is not None and phase != "running":
+                return json_response(
+                    503,
+                    {
+                        "ok": False,
+                        "msg": f"gateway runtime is {phase}",
+                        "data": readiness,
+                    },
+                )
+            return json_response(
+                409,
+                {"ok": False, "msg": "runtime is not ready", "data": readiness},
+            )
         command = body.get("command", "start")
         if not isinstance(command, str) or not command:
             return json_response(400, {"ok": False, "msg": "command must be non-empty string"})

@@ -79,6 +79,30 @@ def test_block_is_idempotent_and_rejects_only_normal_admission() -> None:
     assert command.retry_on_failure is True
 
 
+def test_close_rejects_all_admission_and_preserves_pending_work() -> None:
+    service = _service()
+    service.enqueue_policy_command("pending")
+
+    assert service.close("runtime closing") is True
+    assert service.close("ignored") is False
+    assert service.closed_reason == "runtime closing"
+    assert service.command_dispatch_allowed() is False
+    assert service.block_command_dispatch("unsafe") is False
+
+    for safety in (False, True):
+        with pytest.raises(
+            CommandMailboxUnavailable,
+            match="command mailbox is closed: runtime closing",
+        ):
+            service.enqueue_policy_command("rejected", safety=safety)
+    with pytest.raises(CommandMailboxUnavailable, match="command mailbox is closed"):
+        service.set_record_root("/records")
+
+    assert service.take_next_command() is None
+    assert service.command_queue.qsize() == 1
+    assert service.safety_command_queue.empty()
+
+
 def test_take_rechecks_block_gate_without_dequeueing_pending_work() -> None:
     service = _service()
     service.enqueue_policy_command("normal")

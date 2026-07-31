@@ -66,6 +66,13 @@ def _client(runtime: _Runtime) -> TestClient:
     return TestClient(app)
 
 
+def test_health_keeps_running_response_contract() -> None:
+    response = _client(_Runtime()).get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "msg": "gateway healthy"}
+
+
 def test_malformed_runtime_start_is_rejected_without_enqueuing() -> None:
     runtime = _Runtime()
 

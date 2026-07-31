@@ -191,43 +191,61 @@ def _json_bytes(value: object) -> Any:
 
 
 def handle_command(runtime: GatewayRuntime, node: Any, cmd: Command) -> None:
-    if cmd.kind == "SET_ROOT":
-        raw_root = cmd.payload.get("root")
-        with runtime.lock:
-            runtime.record_root = Path(raw_root) if isinstance(raw_root, str) and raw_root else None
-        return
-
-    command = str(cmd.payload["command"])
-    inputs = dict(cmd.payload.get("inputs") or {})
-    policy_id = str(cmd.payload.get("policy_id") or runtime.config.policy_id)
-    if command == "start_recording" and not inputs.get("output_path"):
-        with runtime.lock:
-            root = runtime.record_root
-        inputs["output_path"] = str(root / "recording.mcap") if root is not None else "recording.mcap"
-
-    from forge_msgs import PolicyCommand
-
-    request_id = str(cmd.payload.get("request_id") or "")
     tracked_command_id = cmd.tracked_command_id
     if not runtime.claim_command_dispatch(tracked_command_id):
         logger.info(
-            "gateway: skip inactive policy command tracked_command_id=%s",
+            "gateway: skip inactive command kind=%s tracked_command_id=%s",
+            cmd.kind,
             tracked_command_id,
         )
         return
-    logger.info("gateway: send policy_command policy_id=%s command=%s inputs=%s", policy_id, command, inputs)
+
     try:
-        msg = PolicyCommand.from_inputs(
-            policy_id=policy_id,
-            command=command,
-            inputs=inputs,
-            request_id=request_id,
-        )
-        node.send_output("policy_command", msg.to_arrow())
-    except Exception as error:
-        runtime.mark_command_dispatch_failed(tracked_command_id or "", error)
-        raise
-    runtime.mark_command_sent(tracked_command_id or "")
+        if cmd.kind == "SET_ROOT":
+            raw_root = cmd.payload.get("root")
+            with runtime.lock:
+                runtime.record_root = (
+                    Path(raw_root)
+                    if isinstance(raw_root, str) and raw_root
+                    else None
+                )
+            return
+
+        try:
+            command = str(cmd.payload["command"])
+            inputs = dict(cmd.payload.get("inputs") or {})
+            policy_id = str(cmd.payload.get("policy_id") or runtime.config.policy_id)
+            if command == "start_recording" and not inputs.get("output_path"):
+                with runtime.lock:
+                    root = runtime.record_root
+                inputs["output_path"] = (
+                    str(root / "recording.mcap")
+                    if root is not None
+                    else "recording.mcap"
+                )
+
+            from forge_msgs import PolicyCommand
+
+            request_id = str(cmd.payload.get("request_id") or "")
+            logger.info(
+                "gateway: send policy_command policy_id=%s command=%s inputs=%s",
+                policy_id,
+                command,
+                inputs,
+            )
+            msg = PolicyCommand.from_inputs(
+                policy_id=policy_id,
+                command=command,
+                inputs=inputs,
+                request_id=request_id,
+            )
+            node.send_output("policy_command", msg.to_arrow())
+        except Exception as error:
+            runtime.mark_command_dispatch_failed(tracked_command_id or "", error)
+            raise
+        runtime.mark_command_sent(tracked_command_id or "")
+    finally:
+        runtime.release_command_dispatch()
 
 
 def drain_commands(runtime: GatewayRuntime, node: Any) -> None:

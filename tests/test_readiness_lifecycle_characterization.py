@@ -13,6 +13,7 @@ import pytest
 from forge_gateway import config
 from forge_gateway.adapters.dora_adapter import handle_dora_input
 from forge_gateway.controllers.runtime_controller import register_runtime_routes
+from forge_gateway.domain.commands import CommandMailboxUnavailable
 from forge_gateway.services import image_service
 from forge_gateway.services.runtime_service import GatewayRuntime
 
@@ -291,7 +292,7 @@ def test_runtime_status_uses_one_readiness_observation() -> None:
     assert payload["readiness"] == payload["state"]["runtime"]["readiness"]
 
 
-def test_current_runtime_accepts_commands_after_close() -> None:
+def test_closed_runtime_rejects_commands_and_is_not_ready() -> None:
     runtime = GatewayRuntime(
         config.GatewayConfig.from_dict(
             {
@@ -304,14 +305,123 @@ def test_current_runtime_accepts_commands_after_close() -> None:
         )
     )
 
-    runtime.close()
-    runtime.enqueue_policy_command("after_close")
+    assert runtime.close() is True
 
-    assert runtime.readiness()["ready"] is True
-    assert runtime.command_queue.qsize() == 1
+    client = _client(runtime)
+    health_response = client.get("/health")
+    start_response = client.post("/runtime/start", json={})
+    assert health_response.status_code == 503
+    assert health_response.json()["data"] == {"phase": "closed"}
+    assert start_response.status_code == 503
+    assert start_response.json()["msg"] == "gateway runtime is closed"
+
+    with pytest.raises(CommandMailboxUnavailable, match="gateway runtime is closed"):
+        runtime.enqueue_policy_command("after_close")
+    with pytest.raises(CommandMailboxUnavailable, match="gateway runtime is closed"):
+        runtime.enqueue_policy_command_if_ready("after_close")
+
+    create_status, _ = runtime.create_agent_session(
+        {
+            "session_id": "closed-session",
+            "command_id": "closed-command",
+            "action_type": "grasp",
+            "target_name": "apple",
+        }
+    )
+    reset_status, _ = runtime.agent_runtime_reset()
+    cancel_status, _ = runtime.cancel_agent_session("missing-session")
+    assert create_status == 503
+    assert reset_status == 503
+    assert cancel_status == 503
+
+    readiness = runtime.readiness()
+    assert readiness["ready"] is False
+    assert readiness["runtime_phase"] == "closed"
+    assert readiness["missing"] == ["runtime:closed"]
+    assert runtime.command_queue.empty()
+    assert runtime.image_encoder.submit("image/front", object(), 1.0) is False
+    assert runtime.close() is True
 
 
-def test_current_inflight_image_can_publish_after_runtime_close(
+def test_concurrent_close_callers_observe_same_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GatewayRuntime(config.GatewayConfig.from_dict({"joint_order": ["j1"]}))
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    original_close = runtime.image_encoder.close
+    results: list[bool] = []
+
+    def delayed_close() -> bool:
+        close_entered.set()
+        assert release_close.wait(timeout=2.0)
+        return original_close()
+
+    monkeypatch.setattr(runtime.image_encoder, "close", delayed_close)
+    threads = [
+        threading.Thread(target=lambda: results.append(runtime.close()))
+        for _ in range(2)
+    ]
+    threads[0].start()
+    assert close_entered.wait(timeout=1.0)
+    threads[1].start()
+    try:
+        assert threads[1].is_alive()
+        release_close.set()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert results == [True, True]
+        assert runtime.phase == "closed"
+    finally:
+        release_close.set()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+
+def test_close_failure_wakes_concurrent_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GatewayRuntime(config.GatewayConfig.from_dict({"joint_order": ["j1"]}))
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    errors: list[BaseException] = []
+
+    def failing_close(reason: str) -> bool:
+        del reason
+        close_entered.set()
+        assert release_close.wait(timeout=2.0)
+        raise RuntimeError("mailbox close failed")
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(runtime.command_service, "close", failing_close)
+    threads = [threading.Thread(target=close_runtime) for _ in range(2)]
+    threads[0].start()
+    assert close_entered.wait(timeout=1.0)
+    threads[1].start()
+    try:
+        release_close.set()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(errors) == 2
+        assert all(str(error) == "gateway runtime close failed" for error in errors)
+        assert runtime.phase == "closing"
+        assert not runtime.image_encoder._thread.is_alive()
+    finally:
+        release_close.set()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+
+def test_inflight_image_cannot_publish_after_runtime_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     encode_started = threading.Event()
@@ -341,14 +451,18 @@ def test_current_inflight_image_can_publish_after_runtime_close(
     )
     worker_thread = runtime.image_encoder._thread
     original_join = worker_thread.join
-    runtime.image_encoder.submit("image/front", "late", 1.0)
+    assert runtime.image_encoder.submit("image/front", "late", 1.0) is True
     assert encode_started.wait(timeout=1.0)
     monkeypatch.setattr(worker_thread, "join", lambda timeout=None: None)
 
-    runtime.close()
+    assert runtime.close() is False
+    assert runtime.phase == "closing"
+    assert runtime.last_error == "image encoder did not stop before shutdown timeout"
     release_encode.set()
     original_join(timeout=1.0)
 
     assert not worker_thread.is_alive()
     with runtime.lock:
-        assert runtime.images["image/front"]["data"] == "late"
+        assert "image/front" not in runtime.images
+    assert runtime.close() is True
+    assert runtime.phase == "closed"

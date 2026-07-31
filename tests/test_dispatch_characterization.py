@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import threading
+import time
 from typing import Any
 
 from forge_msgs import PolicyCommand
 import pytest
 
 from forge_gateway import config
+from forge_gateway.adapters import dora_adapter
 from forge_gateway.adapters.dora_adapter import drain_commands
 from forge_gateway.domain.commands import CommandMailboxUnavailable
+from forge_gateway.services import image_service
 from forge_gateway.services.runtime_service import GatewayRuntime
 
 
@@ -47,6 +51,39 @@ class _BlockingNode(_CapturingNode):
         self.entered.set()
         assert self.release.wait(timeout=2.0)
         super().send_output(output_id, value)
+
+
+class _ObservedRuntimeLock:
+    def __init__(
+        self,
+        observed_thread: threading.Thread,
+        acquisition_attempted: threading.Event,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._observed_thread = observed_thread
+        self._acquisition_attempted = acquisition_attempted
+
+    def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+        if threading.current_thread() is self._observed_thread:
+            self._acquisition_attempted.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> _ObservedRuntimeLock:
+        self.acquire()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.release()
+
 
 
 def _runtime() -> GatewayRuntime:
@@ -99,6 +136,35 @@ def test_current_legacy_send_failure_loses_dequeued_command_and_aborts_drain() -
             assert runtime.last_error == "policy command dispatch failed: send failed"
     finally:
         runtime.close()
+
+
+def test_claimed_command_preparation_failure_clears_dispatch_state() -> None:
+    runtime = _runtime()
+    try:
+        status, _ = runtime.create_agent_session(
+            {
+                "session_id": "session-malformed",
+                "command_id": "command-malformed",
+                "action_type": "grasp",
+                "target_name": "apple",
+            }
+        )
+        assert status == 202
+        queued = runtime.take_next_command()
+        assert queued is not None
+        malformed = replace(queued, payload={})
+
+        with pytest.raises(KeyError, match="command"):
+            dora_adapter.handle_command(runtime, _CapturingNode(), malformed)
+
+        with runtime.lock:
+            command = runtime.commands["command-malformed"]
+            assert command.status == "failed"
+            assert command.dispatching is False
+            assert runtime.sessions["session-malformed"].status == "failed"
+            assert runtime._inflight_dispatches == 0
+    finally:
+        assert runtime.close() is True
 
 
 def test_agent_send_failure_marks_command_and_session_failed() -> None:
@@ -388,6 +454,462 @@ def test_blocked_dispatch_rejects_new_session_without_state_artifacts() -> None:
         assert runtime.command_queue.empty()
     finally:
         runtime.close()
+
+
+def test_blocked_dispatch_close_is_bounded_and_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._dispatch_close_timeout_sec = 0.05
+    node = _BlockingNode()
+    drain_thread = threading.Thread(target=drain_commands, args=(runtime, node))
+    image_cleanup_attempted = threading.Event()
+    original_image_close = runtime.image_encoder.close
+    close_results: list[bool] = []
+    close_errors: list[BaseException] = []
+
+    def observed_image_close() -> bool:
+        image_cleanup_attempted.set()
+        return original_image_close()
+
+    def close_runtime() -> None:
+        try:
+            close_results.append(runtime.close())
+        except BaseException as error:
+            close_errors.append(error)
+
+    monkeypatch.setattr(runtime.image_encoder, "close", observed_image_close)
+    runtime.enqueue_policy_command("blocking_command")
+    close_thread = threading.Thread(target=close_runtime)
+    try:
+        drain_thread.start()
+        assert node.entered.wait(timeout=1.0)
+        close_thread.start()
+        close_thread.join(timeout=1.0)
+
+        assert not close_thread.is_alive()
+        assert close_errors == []
+        assert close_results == [False]
+        assert runtime.phase == "closing"
+        assert image_cleanup_attempted.is_set()
+        assert node.outputs == []
+
+        node.release.set()
+        drain_thread.join(timeout=1.0)
+        assert not drain_thread.is_alive()
+        assert [command.command for command in _commands(node)] == [
+            "blocking_command"
+        ]
+
+        assert runtime.close() is True
+        assert runtime.phase == "closed"
+        sent_after_success = list(node.outputs)
+        drain_commands(runtime, node)
+        assert node.outputs == sent_after_success
+    finally:
+        node.release.set()
+        drain_thread.join(timeout=1.0)
+        close_thread.join(timeout=1.0)
+        if runtime.phase != "closed":
+            runtime.close()
+
+
+def test_mailbox_close_failure_still_waits_for_dispatch_and_wakes_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    runtime._dispatch_close_timeout_sec = 2.0
+    node = _BlockingNode()
+    runtime.enqueue_policy_command("blocking_command")
+    drain_thread = threading.Thread(target=drain_commands, args=(runtime, node))
+    command_close_attempted = threading.Event()
+    dispatch_wait_entered = threading.Event()
+    waiter_registered = threading.Event()
+    image_cleanup_attempted = threading.Event()
+    original_command_close = runtime.command_service.close
+    original_image_close = runtime.image_encoder.close
+    original_dispatch_wait = runtime._dispatch_condition.wait
+    errors: list[BaseException] = []
+
+    def failing_command_close(reason: str) -> bool:
+        del reason
+        command_close_attempted.set()
+        raise RuntimeError("mailbox close failed")
+
+    def observed_dispatch_wait(timeout: float | None = None) -> bool:
+        dispatch_wait_entered.set()
+        return original_dispatch_wait(timeout=timeout)
+
+    def observed_image_close() -> bool:
+        image_cleanup_attempted.set()
+        return original_image_close()
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(runtime.command_service, "close", failing_command_close)
+    monkeypatch.setattr(runtime._dispatch_condition, "wait", observed_dispatch_wait)
+    monkeypatch.setattr(runtime.image_encoder, "close", observed_image_close)
+    close_threads = [threading.Thread(target=close_runtime) for _ in range(2)]
+    try:
+        drain_thread.start()
+        assert node.entered.wait(timeout=1.0)
+        close_threads[0].start()
+        assert command_close_attempted.wait(timeout=1.0)
+        assert dispatch_wait_entered.wait(timeout=1.0)
+        with runtime.lock:
+            attempt = runtime._close_attempt
+        assert attempt is not None
+        original_attempt_wait = attempt.completed.wait
+
+        def observed_attempt_wait(timeout: float | None = None) -> bool:
+            waiter_registered.set()
+            return original_attempt_wait(timeout=timeout)
+
+        monkeypatch.setattr(attempt.completed, "wait", observed_attempt_wait)
+        close_threads[1].start()
+        assert waiter_registered.wait(timeout=1.0)
+        assert image_cleanup_attempted.is_set() is False
+
+        node.release.set()
+        drain_thread.join(timeout=1.0)
+        for thread in close_threads:
+            thread.join(timeout=1.0)
+
+        assert not drain_thread.is_alive()
+        assert all(not thread.is_alive() for thread in close_threads)
+        assert image_cleanup_attempted.is_set()
+        assert len(errors) == 2
+        assert all(str(error) == "gateway runtime close failed" for error in errors)
+        assert runtime.phase == "closing"
+
+        monkeypatch.setattr(runtime.command_service, "close", original_command_close)
+        assert runtime.close() is True
+        assert runtime.phase == "closed"
+    finally:
+        node.release.set()
+        drain_thread.join(timeout=1.0)
+        for thread in close_threads:
+            thread.join(timeout=1.0)
+        if runtime.phase != "closed":
+            monkeypatch.setattr(runtime.command_service, "close", original_command_close)
+            runtime.close()
+
+
+def test_close_attempt_result_is_not_overwritten_by_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    command_close_entered = threading.Event()
+    release_command_close = threading.Event()
+    waiter_registered = threading.Event()
+    both_readers_waiting = threading.Event()
+    release_readers = threading.Event()
+    original_command_close = runtime.command_service.close
+    original_image_close = runtime.image_encoder.close
+    original_result = runtime._completed_close_result
+    image_close_calls = 0
+    first_result_readers = 0
+    readers_lock = threading.Lock()
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def delayed_command_close(reason: str) -> bool:
+        command_close_entered.set()
+        assert release_command_close.wait(timeout=2.0)
+        return original_command_close(reason)
+
+    def first_image_close_times_out() -> bool:
+        nonlocal image_close_calls
+        image_close_calls += 1
+        if image_close_calls == 1:
+            return False
+        return original_image_close()
+
+    def delayed_result(attempt: Any) -> bool:
+        nonlocal first_result_readers
+        if attempt is first_attempt:
+            with readers_lock:
+                first_result_readers += 1
+                if first_result_readers == 2:
+                    both_readers_waiting.set()
+            assert release_readers.wait(timeout=2.0)
+        return original_result(attempt)
+
+    def close_runtime() -> None:
+        try:
+            results.append(runtime.close())
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(runtime.command_service, "close", delayed_command_close)
+    monkeypatch.setattr(runtime.image_encoder, "close", first_image_close_times_out)
+    close_threads = [threading.Thread(target=close_runtime) for _ in range(2)]
+    try:
+        close_threads[0].start()
+        assert command_close_entered.wait(timeout=1.0)
+        with runtime.lock:
+            first_attempt = runtime._close_attempt
+        assert first_attempt is not None
+        original_attempt_wait = first_attempt.completed.wait
+
+        def observed_attempt_wait(timeout: float | None = None) -> bool:
+            waiter_registered.set()
+            return original_attempt_wait(timeout=timeout)
+
+        monkeypatch.setattr(first_attempt.completed, "wait", observed_attempt_wait)
+        monkeypatch.setattr(runtime, "_completed_close_result", delayed_result)
+        close_threads[1].start()
+        assert waiter_registered.wait(timeout=1.0)
+
+        release_command_close.set()
+        assert both_readers_waiting.wait(timeout=1.0)
+        assert runtime.phase == "closing"
+        assert runtime.close() is True
+        assert runtime.phase == "closed"
+
+        release_readers.set()
+        for thread in close_threads:
+            thread.join(timeout=1.0)
+
+        assert all(not thread.is_alive() for thread in close_threads)
+        assert errors == []
+        assert results == [False, False]
+    finally:
+        release_command_close.set()
+        release_readers.set()
+        for thread in close_threads:
+            thread.join(timeout=1.0)
+        if runtime.phase != "closed":
+            runtime.close()
+
+
+def test_close_waits_for_claimed_untracked_dispatch() -> None:
+    runtime = _runtime()
+    node = _BlockingNode()
+    drain_thread = threading.Thread(target=drain_commands, args=(runtime, node))
+    close_results: list[bool] = []
+    close_thread = threading.Thread(
+        target=lambda: close_results.append(runtime.close())
+    )
+    runtime.enqueue_policy_command("blocking_command")
+    try:
+        drain_thread.start()
+        assert node.entered.wait(timeout=1.0)
+        close_thread.start()
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and runtime.phase != "closing":
+            time.sleep(0.01)
+        assert runtime.phase == "closing"
+        assert close_thread.is_alive()
+
+        node.release.set()
+        drain_thread.join(timeout=1.0)
+        close_thread.join(timeout=1.0)
+
+        assert not drain_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert close_results == [True]
+        assert [command.command for command in _commands(node)] == [
+            "blocking_command"
+        ]
+        assert runtime.phase == "closed"
+    finally:
+        node.release.set()
+        drain_thread.join(timeout=1.0)
+        close_thread.join(timeout=1.0)
+        if runtime.phase != "closed":
+            runtime.close()
+
+
+@pytest.mark.parametrize("set_root", [False, True], ids=["policy", "set-root"])
+def test_close_suppresses_dequeued_command_before_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    set_root: bool,
+) -> None:
+    runtime = _runtime()
+    node = _CapturingNode()
+    entered = threading.Event()
+    release = threading.Event()
+    original_handle = dora_adapter.handle_command
+
+    def delayed_handle(runtime_arg: GatewayRuntime, node_arg: Any, command: Any) -> None:
+        entered.set()
+        assert release.wait(timeout=2.0)
+        original_handle(runtime_arg, node_arg, command)
+
+    monkeypatch.setattr(dora_adapter, "handle_command", delayed_handle)
+    if set_root:
+        runtime.set_record_root("/records")
+    else:
+        runtime.enqueue_policy_command("must_not_send")
+    drain_thread = threading.Thread(target=drain_commands, args=(runtime, node))
+    try:
+        drain_thread.start()
+        assert entered.wait(timeout=1.0)
+
+        assert runtime.close() is True
+        release.set()
+        drain_thread.join(timeout=1.0)
+
+        assert not drain_thread.is_alive()
+        assert node.attempts == []
+        assert runtime.record_root is None
+    finally:
+        release.set()
+        drain_thread.join(timeout=1.0)
+        runtime.close()
+
+
+def test_closing_phase_rejects_admission_before_mailbox_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    close_results: list[bool] = []
+    original_close = runtime.command_service.close
+
+    def delayed_close(reason: str) -> bool:
+        close_entered.set()
+        assert release_close.wait(timeout=2.0)
+        return original_close(reason)
+
+    monkeypatch.setattr(runtime.command_service, "close", delayed_close)
+    close_thread = threading.Thread(
+        target=lambda: close_results.append(runtime.close())
+    )
+    try:
+        close_thread.start()
+        assert close_entered.wait(timeout=1.0)
+        assert runtime.phase == "closing"
+
+        with pytest.raises(CommandMailboxUnavailable, match="runtime is closing"):
+            runtime.enqueue_policy_command("too_late")
+
+        assert runtime.command_queue.empty()
+        release_close.set()
+        close_thread.join(timeout=1.0)
+        assert close_results == [True]
+    finally:
+        release_close.set()
+        close_thread.join(timeout=1.0)
+        if runtime.phase != "closed":
+            runtime.close()
+
+
+def test_closing_phase_rejects_images_before_worker_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+    original_stop = runtime.image_encoder.request_stop
+    close_results: list[bool] = []
+
+    def delayed_stop() -> None:
+        stop_entered.set()
+        assert release_stop.wait(timeout=2.0)
+        original_stop()
+
+    monkeypatch.setattr(runtime.image_encoder, "request_stop", delayed_stop)
+    close_thread = threading.Thread(
+        target=lambda: close_results.append(runtime.close())
+    )
+    try:
+        close_thread.start()
+        assert stop_entered.wait(timeout=1.0)
+        assert runtime.phase == "closing"
+        assert runtime.image_encoder.submit("image/front", object(), time.time()) is False
+
+        release_stop.set()
+        close_thread.join(timeout=1.0)
+        assert not close_thread.is_alive()
+        assert close_results == [True]
+    finally:
+        release_stop.set()
+        close_thread.join(timeout=1.0)
+        if runtime.phase != "closed":
+            runtime.close()
+
+
+def test_image_worker_and_submit_use_runtime_then_image_lock_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encode_started = threading.Event()
+    release_encode = threading.Event()
+
+    def blocking_payload(
+        input_id: str,
+        value: object,
+        quality: int,
+    ) -> dict[str, object]:
+        del quality
+        if value == "old":
+            encode_started.set()
+            assert release_encode.wait(timeout=2.0)
+        return {
+            "type": "image",
+            "id": input_id,
+            "format": "jpeg",
+            "content_type": "image/jpeg",
+            "data": str(value),
+        }
+
+    monkeypatch.setattr(image_service, "_image_payload", blocking_payload)
+    runtime = GatewayRuntime(
+        config.GatewayConfig.from_dict(
+            {"joint_order": ["j1"], "image_input_ids": ["image/front"]}
+        )
+    )
+    worker_lock_attempted = threading.Event()
+    observed_lock = _ObservedRuntimeLock(
+        runtime.image_encoder._thread,
+        worker_lock_attempted,
+    )
+    runtime.lock = observed_lock  # type: ignore[assignment]
+    results: list[bool] = []
+    errors: list[str] = []
+
+    assert runtime.image_encoder.submit("image/front", "old", 1.0) is True
+    assert encode_started.wait(timeout=1.0)
+
+    def submit_while_holding_runtime_lock() -> None:
+        with runtime.lock:
+            release_encode.set()
+            if not worker_lock_attempted.wait(timeout=1.0):
+                errors.append("image worker did not attempt the runtime lock")
+                return
+            results.append(
+                runtime.image_encoder.submit("image/front", "new", 2.0)
+            )
+
+    submit_thread = threading.Thread(
+        target=submit_while_holding_runtime_lock,
+        daemon=True,
+    )
+    submit_thread.start()
+    submit_thread.join(timeout=1.0)
+
+    assert not submit_thread.is_alive()
+    assert errors == []
+    assert results == [True]
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        with runtime.lock:
+            latest = runtime.images.get("image/front")
+        if latest is not None:
+            break
+        time.sleep(0.01)
+
+    with runtime.lock:
+        assert runtime.images["image/front"]["data"] == "new"
+    assert runtime.close() is True
 
 
 def test_dequeue_rechecks_dispatch_gate_after_allowed_check(

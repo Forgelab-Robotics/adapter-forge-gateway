@@ -80,58 +80,94 @@ class ImageEncodeWorker:
         self._runtime = runtime
         self._condition = threading.Condition()
         self._input_order: deque[str] = deque()
-        self._latest_inputs: dict[str, tuple[object, float]] = {}
+        self._latest_inputs: dict[str, tuple[object, float, int]] = {}
+        self._generations: dict[str, int] = {}
+        self._submissions_closed = threading.Event()
         self._stopped = False
         self._thread = threading.Thread(target=self._run, name="gateway_image_encoder", daemon=True)
         self._thread.start()
 
-    def submit(self, input_id: str, value: object, timestamp: float) -> None:
+    def submit(self, input_id: str, value: object, timestamp: float) -> bool:
         with self._condition:
-            if self._stopped:
-                return
+            if self._stopped or self._submissions_closed.is_set():
+                return False
+            generation = self._generations.get(input_id, 0) + 1
+            self._generations[input_id] = generation
             if input_id not in self._latest_inputs:
                 self._input_order.append(input_id)
-            self._latest_inputs[input_id] = (value, timestamp)
+            self._latest_inputs[input_id] = (value, timestamp, generation)
             self._condition.notify()
+            return True
 
-    def close(self) -> None:
+    def reject_submissions(self) -> None:
+        """Close the lock-independent admission gate for new frames."""
+        self._submissions_closed.set()
+
+    def request_stop(self) -> None:
+        """Reject new frames and discard pending work without waiting for the worker."""
+        self.reject_submissions()
         with self._condition:
             self._stopped = True
             self._latest_inputs.clear()
             self._input_order.clear()
             self._condition.notify_all()
+
+    def close(self) -> bool:
+        self.request_stop()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        return not self._thread.is_alive()
 
     def _run(self) -> None:
         while True:
             item = self._next_item()
             if item is None:
                 return
-            input_id, value, timestamp = item
+            input_id, value, timestamp, generation = item
             try:
                 payload = _payload_encoder()(input_id, value, self._runtime.config.jpeg_quality)
                 if payload is None:
                     continue
                 with self._runtime.lock:
-                    payload["seq"] = self._runtime.next_image_seq
-                    payload["timestamp"] = timestamp
-                    self._runtime.next_image_seq += 1
-                    self._runtime.images[input_id] = payload
+                    with self._condition:
+                        if (
+                            self._stopped
+                            or self._generations.get(input_id) != generation
+                        ):
+                            continue
+                        self._runtime._publish_image_payload_locked(
+                            input_id,
+                            payload,
+                            timestamp,
+                        )
             except Exception as e:
-                logger.warning("gateway: image worker failed for %s: %s", input_id, e)
                 with self._runtime.lock:
-                    self._runtime.last_error = f"image worker {input_id} failed: {e}"
+                    with self._condition:
+                        if (
+                            self._stopped
+                            or self._generations.get(input_id) != generation
+                        ):
+                            continue
+                        reported = self._runtime._report_image_encode_error_locked(
+                            input_id,
+                            e,
+                        )
+                if reported:
+                    logger.warning(
+                        "gateway: image worker failed for %s: %s",
+                        input_id,
+                        e,
+                    )
 
-    def _next_item(self) -> tuple[str, object, float] | None:
+    def _next_item(self) -> tuple[str, object, float, int] | None:
         with self._condition:
             while not self._stopped and not self._input_order:
                 self._condition.wait()
             if self._stopped:
                 return None
             input_id = self._input_order.popleft()
-            value, timestamp = self._latest_inputs.pop(input_id)
-            return input_id, value, timestamp
+            value, timestamp, generation = self._latest_inputs.pop(input_id)
+            return input_id, value, timestamp, generation
 
 
 ImagePayloadEncoder = Callable[
