@@ -22,20 +22,14 @@ uv sync --frozen --all-groups
 uv run pytest -q
 ```
 
-从源码启动：
+从源码启动并检查帮助信息：
 
 ```bash
-uv run gateway --config config.example.yaml
+uv run python main.py --config config.example.yaml
+uv run python main.py --help
 ```
 
-包入口与 console 入口等价，可分别检查帮助信息：
-
-```bash
-uv run python -m forge_gateway --help
-uv run gateway --help
-```
-
-根目录的 `main.py` 与 `config.py` 仅作为源码 checkout 的兼容 shim；wheel 只安装 `forge_gateway` package。
+这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。
 
 构建独立可执行文件：
 
@@ -90,7 +84,7 @@ Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形
 启动：
 
 ```bash
-uv run gateway --config gateway.yaml
+uv run python main.py --config gateway.yaml
 ```
 
 ## 数据采集面板
@@ -107,7 +101,7 @@ uv run gateway --config gateway.yaml
 打印当前配置支持的 Agent/runtime 接口（不启动 Dora/HTTP）：
 
 ```bash
-uv run gateway --config gateway.yaml --print-capabilities
+uv run python main.py --config gateway.yaml --print-capabilities
 ```
 
 ## HTTP API

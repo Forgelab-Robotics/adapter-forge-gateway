@@ -56,7 +56,7 @@ agent:
   write_context_snapshot: true  # 配置 state_dir 后，是否写 runtime_context.json 快照。
 
   # PAOS Agent 高层 action manifest。
-  # - 未配置 action_manifests 时，Gateway 加载 wheel/可执行文件内置的 piper/sam3.md。
+  # - 未配置 action_manifests 时，Gateway 加载源码 checkout/可执行文件内置的 piper/sam3.md。
   # - 如需外部 manifest，路径推荐为 ./actions/{robot_id}/{policy_id}.md。
   # - 外部相对路径按本配置文件所在目录解析，不按进程工作目录解析。
   # - Gateway 只解析 Markdown YAML frontmatter；正文用于 Agent/人类阅读。

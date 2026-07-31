@@ -14,8 +14,7 @@ dependencies = [
     "pyyaml",
 ]
 
-[project.scripts]
-gateway = "forge_gateway.cli:main"
+
 
 [dependency-groups]
 dev = [
@@ -27,15 +26,15 @@ build = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.uv]
+package = false
 
 [tool.uv.sources]
 forge-msgs = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git", rev = "9f4203dc05b156a238f91f72b7cb28e8fce7fca9", subdirectory = "packages/msgs" }
 forge-common = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git", rev = "9f4203dc05b156a238f91f72b7cb28e8fce7fca9", subdirectory = "packages/common" }
-
-[build-system]
-requires = ["uv_build>=0.12.0,<0.13"]
-build-backend = "uv_build"
 
 [tool.pyright]
 venvPath = "."

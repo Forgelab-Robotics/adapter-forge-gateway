@@ -209,5 +209,5 @@ actions:
 CLI 能力输出：
 
 ```bash
-uv run gateway --config config.example.yaml --print-capabilities
+uv run python main.py --config config.example.yaml --print-capabilities
 ```
