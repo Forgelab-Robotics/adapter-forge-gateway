@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import uvicorn
 
@@ -21,7 +22,7 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
-from forge_gateway.adapters.dora_adapter import DoraEventBuffer, drain_commands, handle_dora_input
+from forge_gateway.adapters.dora_runtime import DoraNodeLike, GatewayDoraRunner
 from forge_gateway.adapters.http_app import create_app
 from forge_gateway.config import load_config
 from forge_gateway.services.runtime_service import GatewayRuntime
@@ -121,47 +122,15 @@ def main() -> int:
     from dora import Node
 
     node = Node()
-    event_queue = DoraEventBuffer()
-    end_sentinel = object()
-
-    def _dora_iter() -> None:
-        try:
-            for event in node:
-                if stop_event.is_set():
-                    break
-                event_queue.put(event)
-        except Exception as e:
-            logger.exception("gateway: dora iteration failed: %s", e)
-            event_queue.put({"type": "ERROR", "error": str(e)})
-        finally:
-            event_queue.put(end_sentinel)
-
-    iter_thread = threading.Thread(target=_dora_iter, name="gateway_dora_iter", daemon=True)
-    iter_thread.start()
+    runner = GatewayDoraRunner(
+        runtime=runtime,
+        node=cast(DoraNodeLike, node),
+        stop_event=stop_event,
+    )
+    runner.start()
 
     try:
-        while not stop_event.is_set():
-            event = event_queue.get(timeout=0.2)
-
-            if event is end_sentinel:
-                break
-            if event is not None:
-                event_type = event.get("type")
-                if event_type == "STOP":
-                    break
-                if event_type == "ERROR":
-                    with runtime.lock:
-                        runtime.last_error = f"dora error: {event.get('error', 'unknown')}"
-                    break
-                if event_type == "INPUT":
-                    try:
-                        handle_dora_input(runtime, str(event.get("id")), event.get("value"))
-                    except Exception as e:
-                        logger.warning("gateway: handle input %s failed: %s", event.get("id"), e)
-                        with runtime.lock:
-                            runtime.last_error = f"input {event.get('id')} failed: {e}"
-
-            drain_commands(runtime, node)
+        runner.run()
     except KeyboardInterrupt:
         logger.info("gateway received KeyboardInterrupt")
     finally:
@@ -171,11 +140,9 @@ def main() -> int:
         thread = getattr(server, "thread", None)
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
-        if iter_thread.is_alive():
-            iter_thread.join(timeout=2.0)
-            if iter_thread.is_alive():
-                logger.error("Dora thread did not exit; forcing process exit")
-                os._exit(1)
+        if not runner.join_reader(timeout=2.0):
+            logger.error("Dora thread did not exit; forcing process exit")
+            os._exit(1)
 
     return 0
 
