@@ -31,13 +31,7 @@ def register_runtime_routes(
 
     @app.get("/runtime/status")
     async def runtime_status() -> dict[str, Any]:
-        return {
-            "ok": True,
-            "data": {
-                "readiness": runtime.readiness(),
-                "state": runtime.state_snapshot(),
-            },
-        }
+        return {"ok": True, "data": runtime.runtime_status_snapshot()}
 
     @app.post("/runtime/start")
     async def runtime_start(request: Request) -> JSONResponse:
@@ -54,9 +48,14 @@ def register_runtime_routes(
         if not isinstance(inputs, dict):
             return json_response(400, {"ok": False, "msg": "inputs must be an object"})
         try:
-            runtime.enqueue_policy_command(command, inputs)
+            accepted, readiness = runtime.enqueue_policy_command_if_ready(command, inputs)
         except CommandMailboxUnavailable as error:
             return command_unavailable_response(error)
+        if not accepted:
+            return json_response(
+                409,
+                {"ok": False, "msg": "runtime is not ready", "data": readiness},
+            )
         return json_response(200, {"ok": True, "data": readiness})
 
     @app.post("/runtime/reset_scene")

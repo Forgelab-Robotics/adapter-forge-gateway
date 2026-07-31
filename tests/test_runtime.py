@@ -73,6 +73,44 @@ def test_readiness_passes_when_required_signals_arrive() -> None:
         runtime.close()
 
 
+def test_runtime_status_snapshot_reuses_one_readiness_observation() -> None:
+    cfg = config.GatewayConfig.from_dict(
+        {
+            "joint_order": ["j1"],
+            "readiness": {
+                "require_proprio_state": False,
+                "require_images": False,
+            },
+        }
+    )
+    runtime = GatewayRuntime(cfg)
+    try:
+        status = runtime.runtime_status_snapshot()
+
+        assert status["readiness"] == status["state"]["runtime"]["readiness"]
+        assert status["readiness"]["ready"] is True
+    finally:
+        runtime.close()
+
+
+def test_atomic_runtime_command_admission_rejects_unready_state() -> None:
+    cfg = config.GatewayConfig.from_dict(
+        {
+            "joint_order": ["j1"],
+            "readiness": {"require_images": False},
+        }
+    )
+    runtime = GatewayRuntime(cfg)
+    try:
+        accepted, readiness = runtime.enqueue_policy_command_if_ready("start")
+
+        assert accepted is False
+        assert readiness["ready"] is False
+        assert runtime.command_queue.empty()
+    finally:
+        runtime.close()
+
+
 def test_latest_image_updates_since_returns_only_current_payload() -> None:
     cfg = config.GatewayConfig.from_dict(
         {

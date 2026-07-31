@@ -21,7 +21,15 @@ class _Runtime:
         return {"ready": self.ready, "missing": [] if self.ready else ["proprio_state"]}
 
     def state_snapshot(self) -> dict[str, Any]:
-        return {}
+        readiness = self.readiness()
+        return {"runtime": {"readiness": readiness}}
+
+    def runtime_status_snapshot(self) -> dict[str, Any]:
+        state = self.state_snapshot()
+        return {
+            "readiness": dict(state["runtime"]["readiness"]),
+            "state": state,
+        }
 
     def enqueue_policy_command(
         self,
@@ -31,6 +39,17 @@ class _Runtime:
         if self.unavailable is not None:
             raise CommandMailboxUnavailable(self.unavailable)
         self.commands.append((command, inputs))
+
+    def enqueue_policy_command_if_ready(
+        self,
+        command: str,
+        inputs: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        readiness = self.readiness()
+        if not readiness["ready"]:
+            return False, readiness
+        self.enqueue_policy_command(command, inputs)
+        return True, readiness
 
     def agent_runtime_reset(
         self,

@@ -154,6 +154,19 @@ class GatewayRuntime:
             safety=safety,
         )
 
+    def enqueue_policy_command_if_ready(
+        self,
+        command: str,
+        inputs: dict[str, Any] | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Atomically recheck readiness and admit a runtime start command."""
+        with self.lock:
+            readiness = self._readiness_locked(time.time())
+            if not readiness["ready"]:
+                return False, readiness
+            self.command_service.enqueue_policy_command(command, inputs)
+            return True, readiness
+
     def set_record_root(self, root: str | None) -> None:
         self.command_service.set_record_root(root)
 
@@ -179,20 +192,15 @@ class GatewayRuntime:
 
     def state_snapshot(self) -> dict[str, Any]:
         with self.lock:
+            return self._state_snapshot_locked(time.time())
+
+    def runtime_status_snapshot(self) -> dict[str, Any]:
+        """Return one internally consistent HTTP runtime status observation."""
+        with self.lock:
+            state = self._state_snapshot_locked(time.time())
             return {
-                "running_time": round(time.time() - self.start_time, 3),
-                "current_frame_count": self.current_frame_count,
-                "sensors": {
-                    "joints": dict(self.proprio_state),
-                    "command": dict(self.action),
-                },
-                "runtime": {
-                    "sim_status": dict(self.sim_status),
-                    "record_status": dict(self.record_status),
-                    "playback_status": dict(self.playback_status),
-                    "readiness": self._readiness_locked(time.time()),
-                    "last_error": self.last_error,
-                },
+                "readiness": dict(state["runtime"]["readiness"]),
+                "state": state,
             }
 
     def agent_capabilities(self) -> dict[str, Any]:
@@ -327,6 +335,23 @@ class GatewayRuntime:
         self.image_encoder.close()
         with self.lock:
             self._write_snapshot_locked(time.time())
+
+    def _state_snapshot_locked(self, now: float) -> dict[str, Any]:
+        return {
+            "running_time": round(now - self.start_time, 3),
+            "current_frame_count": self.current_frame_count,
+            "sensors": {
+                "joints": dict(self.proprio_state),
+                "command": dict(self.action),
+            },
+            "runtime": {
+                "sim_status": dict(self.sim_status),
+                "record_status": dict(self.record_status),
+                "playback_status": dict(self.playback_status),
+                "readiness": self._readiness_locked(now),
+                "last_error": self.last_error,
+            },
+        }
 
     def _readiness_locked(self, now: float) -> dict[str, Any]:
         cfg = self.config.readiness

@@ -30,6 +30,13 @@ class _RacingRuntime:
     def state_snapshot(self) -> dict[str, object]:
         return {"runtime": {"readiness": {"ready": False, "missing": ["expired"]}}}
 
+    def runtime_status_snapshot(self) -> dict[str, object]:
+        state = self.state_snapshot()
+        return {
+            "readiness": {"ready": False, "missing": ["expired"]},
+            "state": state,
+        }
+
     def enqueue_policy_command(
         self,
         command: str,
@@ -37,6 +44,20 @@ class _RacingRuntime:
     ) -> None:
         assert self.ready is False
         self.commands.append((command, inputs))
+
+    def enqueue_policy_command_if_ready(
+        self,
+        command: str,
+        inputs: dict[str, object],
+    ) -> tuple[bool, dict[str, object]]:
+        readiness: dict[str, object] = {
+            "ready": self.ready,
+            "missing": [] if self.ready else ["expired"],
+        }
+        if not self.ready:
+            return False, readiness
+        self.commands.append((command, inputs))
+        return True, readiness
 
     def agent_runtime_reset(
         self,
@@ -248,25 +269,26 @@ def test_fresh_timestamp_without_proprio_values_is_not_ready() -> None:
         runtime.close()
 
 
-def test_current_runtime_start_can_enqueue_after_readiness_expires() -> None:
+def test_runtime_start_rechecks_readiness_before_enqueue() -> None:
     runtime = _RacingRuntime()
 
     response = _client(runtime).post("/runtime/start", json={})
 
-    assert response.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["data"] == {"ready": False, "missing": ["expired"]}
     assert runtime.ready is False
-    assert runtime.commands == [("start", {})]
+    assert runtime.commands == []
 
 
-def test_current_runtime_status_can_contain_two_readiness_observations() -> None:
+def test_runtime_status_uses_one_readiness_observation() -> None:
     runtime = _RacingRuntime()
 
     response = _client(runtime).get("/runtime/status")
 
     assert response.status_code == 200
     payload = response.json()["data"]
-    assert payload["readiness"]["ready"] is True
-    assert payload["state"]["runtime"]["readiness"]["ready"] is False
+    assert payload["readiness"] == {"ready": False, "missing": ["expired"]}
+    assert payload["readiness"] == payload["state"]["runtime"]["readiness"]
 
 
 def test_current_runtime_accepts_commands_after_close() -> None:
