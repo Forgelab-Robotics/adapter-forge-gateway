@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import queue
 import threading
+from dataclasses import replace
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from forge_gateway.services.runtime_service import GatewayRuntime
 
 try:
     from forge_common import get_logger
@@ -166,22 +170,45 @@ def handle_command(runtime: GatewayRuntime, node: Any, cmd: Command) -> None:
     from forge_msgs import PolicyCommand
 
     request_id = str(cmd.payload.get("request_id") or "")
+    tracked_command_id = cmd.tracked_command_id
+    if not runtime.claim_command_dispatch(tracked_command_id):
+        logger.info(
+            "gateway: skip inactive policy command tracked_command_id=%s",
+            tracked_command_id,
+        )
+        return
     logger.info("gateway: send policy_command policy_id=%s command=%s inputs=%s", policy_id, command, inputs)
-    msg = PolicyCommand.from_inputs(
-        policy_id=policy_id,
-        command=command,
-        inputs=inputs,
-        request_id=request_id,
-    )
-    node.send_output("policy_command", msg.to_arrow())
-    runtime.mark_command_sent(request_id)
+    try:
+        msg = PolicyCommand.from_inputs(
+            policy_id=policy_id,
+            command=command,
+            inputs=inputs,
+            request_id=request_id,
+        )
+        node.send_output("policy_command", msg.to_arrow())
+    except Exception as error:
+        runtime.mark_command_dispatch_failed(tracked_command_id or "", error)
+        raise
+    runtime.mark_command_sent(tracked_command_id or "")
 
 
 def drain_commands(runtime: GatewayRuntime, node: Any) -> None:
-    while True:
+    while runtime.command_dispatch_allowed():
         try:
             cmd = runtime.command_queue.get_nowait()
         except queue.Empty:
             return
-        handle_command(runtime, node, cmd)
+        current = cmd
+        while True:
+            try:
+                handle_command(runtime, node, current)
+                break
+            except Exception as error:
+                logger.error("gateway: dispatch failed: %s", error)
+                if not current.retry_on_failure:
+                    break
+                if current.attempt >= 2:
+                    runtime.block_command_dispatch(error)
+                    return
+                current = replace(current, attempt=current.attempt + 1)
 

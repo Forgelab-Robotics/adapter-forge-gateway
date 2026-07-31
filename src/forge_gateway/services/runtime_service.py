@@ -44,6 +44,7 @@ class GatewayRuntime:
         self.command_queue: queue.Queue[Command] = queue.Queue()
         self.record_root: Path | None = None
         self.last_error: str | None = None
+        self.dispatch_blocked_reason: str | None = None
         self.start_time = time.time()
         self.current_frame_count = 0
         self.proprio_state: dict[str, float] = {}
@@ -88,6 +89,9 @@ class GatewayRuntime:
         *,
         request_id: str = "",
         policy_id: str | None = None,
+        tracked_command_id: str | None = None,
+        retry_on_failure: bool = False,
+        attempt: int = 0,
     ) -> None:
         self.command_queue.put(
             Command(
@@ -98,11 +102,33 @@ class GatewayRuntime:
                     "request_id": request_id,
                     "policy_id": policy_id or self.config.policy_id,
                 },
+                tracked_command_id=tracked_command_id,
+                retry_on_failure=retry_on_failure,
+                attempt=attempt,
             )
         )
 
     def set_record_root(self, root: str | None) -> None:
         self.command_queue.put(Command(kind="SET_ROOT", payload={"root": root}))
+
+    def command_dispatch_allowed(self) -> bool:
+        with self.lock:
+            return self.dispatch_blocked_reason is None
+
+    def block_command_dispatch(self, error: Exception) -> None:
+        now = time.time()
+        reason = f"safety command dispatch exhausted retries: {error}"
+        with self.lock:
+            if self.dispatch_blocked_reason is not None:
+                return
+            self.dispatch_blocked_reason = reason
+            self.last_error = reason
+            self._append_event_locked(
+                "command_dispatch_blocked",
+                {"error": str(error)},
+                now=now,
+            )
+            self._write_snapshot_locked(now)
 
     def state_snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -247,6 +273,13 @@ class GatewayRuntime:
             self.sessions[session_id] = session
             self.commands[command_id] = command_state
             self.active_session_id = session_id
+            self.enqueue_policy_command(
+                command,
+                policy_inputs,
+                request_id=command_id,
+                policy_id=policy_id,
+                tracked_command_id=command_id,
+            )
             self._append_event_locked(
                 "session_created",
                 {"session": session.to_dict(), "command": command_state.to_dict()},
@@ -254,7 +287,6 @@ class GatewayRuntime:
             )
             self._write_snapshot_locked(now)
 
-        self.enqueue_policy_command(command, policy_inputs, request_id=command_id, policy_id=policy_id)
         return 202, {
             "ok": True,
             "data": {
@@ -283,43 +315,63 @@ class GatewayRuntime:
 
     def cancel_agent_session(self, session_id: str) -> tuple[int, dict[str, Any]]:
         now = time.time()
-        stop_commands: list[tuple[str, dict[str, Any], str, str]] = []
+        cancellation_requested = False
         with self.lock:
             session = self.sessions.get(session_id)
             if session is None:
                 return 404, {"ok": False, "msg": f"session not found: {session_id}"}
             for command_id in session.command_ids:
                 command = self.commands.get(command_id)
-                if command is not None and command.status in ("queued", "sent", "running"):
-                    command.status = "cancelled"
-                    command.updated_at = now
-                    command.message = "cancel requested by agent"
-                    stop_commands.append(
-                        (
-                            command.policy_id,
-                            {
-                                "session_id": session_id,
-                                "command_id": f"cancel_{command.command_id}",
-                                "cancelled_command_id": command.command_id,
-                                "action_type": command.action_type,
-                                "source": "paos-agent",
-                                "reason": "agent_cancel",
-                            },
-                            f"cancel_{command.command_id}",
-                            "stop",
-                        )
+                if command is None or command.status not in ("queued", "sent", "running"):
+                    continue
+                previous_status = command.status
+                cancellation_requested = True
+                command.status = "cancelled"
+                command.updated_at = now
+                command.message = "cancel requested by agent"
+                if previous_status in ("sent", "running") or command.dispatching:
+                    self.enqueue_policy_command(
+                        "stop",
+                        {
+                            "session_id": session_id,
+                            "command_id": f"cancel_{command.command_id}",
+                            "cancelled_command_id": command.command_id,
+                            "action_type": command.action_type,
+                            "source": "paos-agent",
+                            "reason": "agent_cancel",
+                        },
+                        request_id=f"cancel_{command.command_id}",
+                        policy_id=command.policy_id,
+                        retry_on_failure=True,
                     )
-            session.status = "cancelled"
-            session.updated_at = now
-            session.message = "cancel requested by agent"
-            if self.active_session_id == session_id:
-                self.active_session_id = None
-            self._append_event_locked("session_cancelled", {"session_id": session_id}, now=now)
-            self._write_snapshot_locked(now)
+            if cancellation_requested:
+                session.status = "cancelled"
+                session.updated_at = now
+                session.message = "cancel requested by agent"
+                if self.active_session_id == session_id:
+                    self.active_session_id = None
+                self._append_event_locked(
+                    "session_cancelled",
+                    {"session_id": session_id},
+                    now=now,
+                )
+                self._write_snapshot_locked(now)
+            response_status = session.status
 
-        for policy_id, inputs, request_id, command in stop_commands:
-            self.enqueue_policy_command(command, inputs, request_id=request_id, policy_id=policy_id)
-        return 200, {"ok": True, "data": {"session_id": session_id, "status": "cancelled"}}
+        return 200, {
+            "ok": True,
+            "data": {"session_id": session_id, "status": response_status},
+        }
+
+    def claim_command_dispatch(self, command_id: str | None) -> bool:
+        if not command_id:
+            return True
+        with self.lock:
+            command = self.commands.get(command_id)
+            if command is None or command.status != "queued" or command.dispatching:
+                return False
+            command.dispatching = True
+            return True
 
     def mark_command_sent(self, command_id: str) -> None:
         if not command_id:
@@ -329,14 +381,51 @@ class GatewayRuntime:
             command = self.commands.get(command_id)
             if command is None:
                 return
+            command.dispatching = False
+            if command.status != "queued":
+                return
             command.status = "sent"
             command.sent_at = now
             command.updated_at = now
             session = self.sessions.get(command.session_id)
-            if session is not None:
+            if session is not None and session.status == "queued":
                 session.status = "running"
                 session.updated_at = now
             self._append_event_locked("command_sent", {"command_id": command_id}, now=now)
+            self._write_snapshot_locked(now)
+
+    def mark_command_dispatch_failed(self, command_id: str, error: Exception) -> None:
+        now = time.time()
+        message = f"policy command dispatch failed: {error}"
+        with self.lock:
+            self.last_error = message
+            command = self.commands.get(command_id)
+            if command is None:
+                self._append_event_locked(
+                    "command_dispatch_failed",
+                    {"command_id": command_id, "error": str(error)},
+                    now=now,
+                )
+                self._write_snapshot_locked(now)
+                return
+            command.dispatching = False
+            if command.status in ("succeeded", "failed", "cancelled"):
+                return
+            command.status = "failed"
+            command.updated_at = now
+            command.message = message
+            session = self.sessions.get(command.session_id)
+            if session is not None and session.status not in ("succeeded", "failed", "cancelled"):
+                session.status = "failed"
+                session.updated_at = now
+                session.message = message
+                if self.active_session_id == session.session_id:
+                    self.active_session_id = None
+            self._append_event_locked(
+                "command_dispatch_failed",
+                {"command_id": command_id, "error": str(error)},
+                now=now,
+            )
             self._write_snapshot_locked(now)
 
     def apply_policy_command_status(self, value: object) -> None:
@@ -344,25 +433,33 @@ class GatewayRuntime:
 
         status_msg = PolicyCommandStatus.from_arrow(value)  # type: ignore[arg-type]
         outputs = status_msg.outputs()
-        command_id = status_msg.request_id or str(outputs.get("command_id") or "")
+        command_id = status_msg.request_id
         now = time.time()
         with self.lock:
             command = self.commands.get(command_id)
             mapped_status = map_policy_status(status_msg.status)
             if command is not None:
-                if command.status != "cancelled":
+                identity_matches = (
+                    status_msg.policy_id == command.policy_id
+                    and status_msg.command == command.command
+                )
+                mutable_status = command.status in ("sent", "running")
+                if identity_matches and mutable_status:
                     command.status = mapped_status
                     command.updated_at = now
                     command.message = status_msg.message
                     command.outputs = outputs
                     session = self.sessions.get(command.session_id)
-                    if session is not None:
+                    if session is not None and session.status in ("queued", "running"):
                         session.status = session_status_from_command(mapped_status)
                         session.updated_at = now
                         session.message = status_msg.message
-                        if session.status in ("succeeded", "failed", "cancelled") and self.active_session_id == session.session_id:
+                        if (
+                            session.status in ("succeeded", "failed", "cancelled")
+                            and self.active_session_id == session.session_id
+                        ):
                             self.active_session_id = None
-                else:
+                elif identity_matches and command.status == "cancelled":
                     command.updated_at = now
                     command.outputs = outputs
             self.last_result = {

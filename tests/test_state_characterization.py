@@ -59,10 +59,13 @@ def _create_and_send(runtime: GatewayRuntime, suffix: str) -> None:
 def _status(
     command_id: str,
     status: Literal["accepted", "done"],
+    *,
+    policy_id: str = "sam3",
+    command: str = "grasp_simple",
 ) -> object:
     return PolicyCommandStatus.from_outputs(
-        policy_id="wrong-policy",
-        command="wrong_command",
+        policy_id=policy_id,
+        command=command,
         request_id=command_id,
         status=status,
         outputs={"command_id": command_id},
@@ -103,22 +106,55 @@ def test_current_legacy_future_image_timestamp_counts_as_ready() -> None:
         runtime.close()
 
 
-def test_current_legacy_status_identity_is_ignored_and_terminal_state_regresses() -> None:
+def test_status_requires_matching_identity_and_terminal_state_is_absorbing() -> None:
     runtime = _runtime()
     try:
         _create_and_send(runtime, "regress")
+        runtime.apply_policy_command_status(
+            _status(
+                "command-regress",
+                "done",
+                policy_id="wrong-policy",
+                command="wrong_command",
+            )
+        )
+        with runtime.lock:
+            assert runtime.commands["command-regress"].status == "sent"
+            assert runtime.sessions["session-regress"].status == "running"
+
         runtime.apply_policy_command_status(_status("command-regress", "done"))
         runtime.apply_policy_command_status(_status("command-regress", "accepted"))
 
         with runtime.lock:
-            assert runtime.commands["command-regress"].status == "running"
-            assert runtime.sessions["session-regress"].status == "running"
+            assert runtime.commands["command-regress"].status == "succeeded"
+            assert runtime.sessions["session-regress"].status == "succeeded"
             assert runtime.active_session_id is None
     finally:
         runtime.close()
 
 
-def test_current_legacy_status_before_dispatch_is_regressed_by_mark_sent() -> None:
+def test_empty_request_id_does_not_fall_back_to_outputs_command_id() -> None:
+    runtime = _runtime()
+    try:
+        _create_and_send(runtime, "fallback")
+        status = PolicyCommandStatus.from_outputs(
+            policy_id="sam3",
+            command="grasp_simple",
+            request_id="",
+            status="done",
+            outputs={"command_id": "command-fallback"},
+        )
+
+        runtime.apply_policy_command_status(status.to_arrow())
+
+        with runtime.lock:
+            assert runtime.commands["command-fallback"].status == "sent"
+            assert runtime.sessions["session-fallback"].status == "running"
+    finally:
+        runtime.close()
+
+
+def test_status_before_dispatch_is_ignored_then_command_is_marked_sent() -> None:
     runtime = _runtime()
     try:
         status, _ = runtime.create_agent_session(
@@ -136,7 +172,7 @@ def test_current_legacy_status_before_dispatch_is_regressed_by_mark_sent() -> No
         with runtime.lock:
             assert runtime.commands["command-before"].status == "sent"
             assert runtime.sessions["session-before"].status == "running"
-            assert runtime.active_session_id is None
+            assert runtime.active_session_id == "session-before"
     finally:
         runtime.close()
 

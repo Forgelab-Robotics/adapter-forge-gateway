@@ -14,6 +14,9 @@ CommandStatus = Literal["queued", "sent", "running", "succeeded", "failed", "can
 class Command:
     kind: CommandKind
     payload: dict[str, Any]
+    tracked_command_id: str | None = None
+    retry_on_failure: bool = False
+    attempt: int = 0
 
 
 @dataclass
@@ -31,6 +34,7 @@ class CommandState:
     sent_at: float | None = None
     message: str = ""
     outputs: dict[str, Any] | None = None
+    dispatching: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
