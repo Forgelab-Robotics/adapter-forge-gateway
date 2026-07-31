@@ -8,11 +8,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from forge_gateway.controllers.runtime_controller import register_runtime_routes
+from forge_gateway.domain.commands import CommandMailboxUnavailable
 
 
 class _Runtime:
-    def __init__(self, *, ready: bool = True) -> None:
+    def __init__(self, *, ready: bool = True, unavailable: str | None = None) -> None:
         self.ready = ready
+        self.unavailable = unavailable
         self.commands: list[tuple[str, dict[str, Any]]] = []
 
     def readiness(self) -> dict[str, Any]:
@@ -26,6 +28,8 @@ class _Runtime:
         command: str,
         inputs: dict[str, Any],
     ) -> None:
+        if self.unavailable is not None:
+            raise CommandMailboxUnavailable(self.unavailable)
         self.commands.append((command, inputs))
 
     def agent_runtime_reset(
@@ -77,6 +81,16 @@ def test_valid_empty_runtime_start_keeps_default_start_contract() -> None:
 
     assert response.status_code == 200
     assert runtime.commands == [("start", {})]
+
+
+def test_runtime_start_reports_mailbox_backpressure_as_503() -> None:
+    runtime = _Runtime(unavailable="command mailbox is full")
+
+    response = _client(runtime).post("/runtime/start", json={})
+
+    assert response.status_code == 503
+    assert response.json() == {"ok": False, "msg": "command mailbox is full"}
+    assert runtime.commands == []
 
 
 def test_current_readiness_gate_runs_before_request_validation() -> None:

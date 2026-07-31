@@ -11,7 +11,12 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from forge_gateway.controllers.utils import json_response, read_json
+from forge_gateway.controllers.utils import (
+    command_unavailable_response,
+    json_response,
+    read_json,
+)
+from forge_gateway.domain.commands import CommandMailboxUnavailable
 
 
 def register_runtime_routes(
@@ -48,7 +53,10 @@ def register_runtime_routes(
         inputs = body.get("inputs") or {}
         if not isinstance(inputs, dict):
             return json_response(400, {"ok": False, "msg": "inputs must be an object"})
-        runtime.enqueue_policy_command(command, inputs)
+        try:
+            runtime.enqueue_policy_command(command, inputs)
+        except CommandMailboxUnavailable as error:
+            return command_unavailable_response(error)
         return json_response(200, {"ok": True, "data": readiness})
 
     @app.post("/runtime/reset_scene")

@@ -7,7 +7,12 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from forge_gateway.controllers.utils import json_response, read_json
+from forge_gateway.controllers.utils import (
+    command_unavailable_response,
+    json_response,
+    read_json,
+)
+from forge_gateway.domain.commands import CommandMailboxUnavailable
 
 
 def register_record_routes(app: FastAPI, runtime: Any) -> None:
@@ -32,7 +37,10 @@ def register_record_routes(app: FastAPI, runtime: Any) -> None:
             if not isinstance(metadata, dict):
                 return json_response(400, {"ok": False, "msg": "metadata must be an object"})
             inputs["metadata"] = metadata
-        runtime.enqueue_policy_command(commands[action], inputs)
+        try:
+            runtime.enqueue_policy_command(commands[action], inputs)
+        except CommandMailboxUnavailable as error:
+            return command_unavailable_response(error)
         return json_response(200, {"ok": True})
 
     @app.post("/record/set_root")
@@ -43,7 +51,10 @@ def register_record_routes(app: FastAPI, runtime: Any) -> None:
         root = body.get("root")
         if not isinstance(root, str) or not root:
             return json_response(400, {"ok": False, "msg": "root must be non-empty string"})
-        runtime.set_record_root(root)
+        try:
+            runtime.set_record_root(root)
+        except CommandMailboxUnavailable as error:
+            return command_unavailable_response(error)
         return json_response(200, {"ok": True})
 
     @app.get("/record/status")

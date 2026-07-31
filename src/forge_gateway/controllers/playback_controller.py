@@ -7,7 +7,12 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from forge_gateway.controllers.utils import json_response, read_json
+from forge_gateway.controllers.utils import (
+    command_unavailable_response,
+    json_response,
+    read_json,
+)
+from forge_gateway.domain.commands import CommandMailboxUnavailable
 
 
 def register_playback_routes(app: FastAPI, runtime: Any) -> None:
@@ -28,7 +33,10 @@ def register_playback_routes(app: FastAPI, runtime: Any) -> None:
         inputs: dict[str, Any] = {}
         if "mcap_path" in body:
             inputs["mcap_path"] = body["mcap_path"]
-        runtime.enqueue_policy_command(command_map[str(action)], inputs)
+        try:
+            runtime.enqueue_policy_command(command_map[str(action)], inputs)
+        except CommandMailboxUnavailable as error:
+            return command_unavailable_response(error)
         return json_response(200, {"ok": True})
 
     @app.get("/playback/status")

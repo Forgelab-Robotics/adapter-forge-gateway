@@ -10,6 +10,10 @@ CommandKind = Literal["POLICY_COMMAND", "SET_ROOT"]
 CommandStatus = Literal["queued", "sent", "running", "succeeded", "failed", "cancelled"]
 
 
+class CommandMailboxUnavailable(RuntimeError):
+    """Raised when outbound work cannot be accepted safely."""
+
+
 @dataclass(frozen=True)
 class Command:
     kind: CommandKind

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import threading
 from dataclasses import replace
 import time
@@ -194,9 +193,8 @@ def handle_command(runtime: GatewayRuntime, node: Any, cmd: Command) -> None:
 
 def drain_commands(runtime: GatewayRuntime, node: Any) -> None:
     while runtime.command_dispatch_allowed():
-        try:
-            cmd = runtime.command_queue.get_nowait()
-        except queue.Empty:
+        cmd = runtime.take_next_command()
+        if cmd is None:
             return
         current = cmd
         while True:

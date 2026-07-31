@@ -33,6 +33,7 @@ actions:
                 "image_input_ids": ["image/front"],
                 "port": 9002,
                 "ws_send_timeout_sec": 0.5,
+                "command_queue_capacity": 32,
                 "readiness": {
                     "require_proprio_state": True,
                     "require_images": True,
@@ -55,6 +56,7 @@ actions:
     assert cfg.image_input_ids == ["image/front"]
     assert cfg.port == 9002
     assert cfg.ws_send_timeout_sec == 0.5
+    assert cfg.command_queue_capacity == 32
     assert cfg.readiness.require_state_client is True
     assert cfg.readiness.proprio_stale_after_sec == 3.0
     assert cfg.readiness.image_stale_after_sec == 1.5

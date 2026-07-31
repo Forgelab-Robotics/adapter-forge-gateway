@@ -110,6 +110,7 @@ class GatewayConfig:
     ws_send_timeout_sec: float = 1.0
     jpeg_quality: int = 85
     policy_id: str = "default"
+    command_queue_capacity: int = 256
     readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
 
@@ -136,6 +137,7 @@ class GatewayConfig:
             ws_send_timeout_sec=max(0.1, float(data.get("ws_send_timeout_sec", 1.0))),
             jpeg_quality=jpeg_quality,
             policy_id=str(data.get("policy_id", "default")),
+            command_queue_capacity=max(1, int(data.get("command_queue_capacity", 256))),
             readiness=ReadinessConfig.from_dict(data.get("readiness")),
             agent=AgentConfig.from_dict(data.get("agent"), base_dir=base_dir),
         )

@@ -7,9 +7,11 @@ import threading
 from typing import Any
 
 from forge_msgs import PolicyCommand
+import pytest
 
 from forge_gateway import config
 from forge_gateway.adapters.dora_adapter import drain_commands
+from forge_gateway.domain.commands import CommandMailboxUnavailable
 from forge_gateway.services.runtime_service import GatewayRuntime
 
 
@@ -291,12 +293,98 @@ def test_record_root_is_resolved_when_fifo_command_is_drained() -> None:
         runtime.close()
 
 
-def test_current_legacy_command_queue_is_unbounded() -> None:
+def test_command_queue_rejects_work_at_configured_capacity() -> None:
     runtime = _runtime()
     try:
-        assert runtime.command_queue.maxsize == 0
-        for index in range(1_024):
+        assert runtime.config.command_queue_capacity == 256
+        assert runtime.command_queue.maxsize == 256
+        for index in range(256):
             runtime.enqueue_policy_command(f"command_{index}", {})
-        assert runtime.command_queue.qsize() == 1_024
+        with pytest.raises(CommandMailboxUnavailable, match="mailbox is full"):
+            runtime.enqueue_policy_command("overflow", {})
+        assert runtime.command_queue.qsize() == 256
+    finally:
+        runtime.close()
+
+
+def test_safety_stop_overtakes_a_full_normal_mailbox() -> None:
+    cfg = config.GatewayConfig.from_dict(
+        {"joint_order": ["j1"], "command_queue_capacity": 2}
+    )
+    runtime = GatewayRuntime(cfg)
+    try:
+        status, _ = runtime.create_agent_session(
+            {
+                "session_id": "session-priority",
+                "command_id": "command-priority",
+                "action_type": "grasp",
+                "target_name": "apple",
+            }
+        )
+        assert status == 202
+        first_node = _CapturingNode()
+        drain_commands(runtime, first_node)
+        runtime.enqueue_policy_command("normal_one", {})
+        runtime.enqueue_policy_command("normal_two", {})
+        runtime.cancel_agent_session("session-priority")
+        node = _CapturingNode()
+
+        drain_commands(runtime, node)
+
+        assert [command.command for command in _commands(node)] == [
+            "stop",
+            "normal_one",
+            "normal_two",
+        ]
+    finally:
+        runtime.close()
+
+
+def test_agent_session_creation_rolls_back_when_mailbox_is_full() -> None:
+    cfg = config.GatewayConfig.from_dict(
+        {"joint_order": ["j1"], "command_queue_capacity": 1}
+    )
+    runtime = GatewayRuntime(cfg)
+    try:
+        runtime.enqueue_policy_command("occupy", {})
+
+        status, response = runtime.create_agent_session(
+            {
+                "session_id": "session-full",
+                "command_id": "command-full",
+                "action_type": "grasp",
+                "target_name": "apple",
+            }
+        )
+
+        assert status == 503
+        assert response == {"ok": False, "msg": "command mailbox is full"}
+        assert runtime.sessions == {}
+        assert runtime.commands == {}
+        assert runtime.active_session_id is None
+        assert runtime.command_queue.qsize() == 1
+    finally:
+        runtime.close()
+
+
+def test_blocked_dispatch_rejects_new_session_without_state_artifacts() -> None:
+    runtime = _runtime()
+    try:
+        runtime.block_command_dispatch(RuntimeError("unsafe"))
+
+        status, response = runtime.create_agent_session(
+            {
+                "session_id": "session-blocked",
+                "command_id": "command-blocked",
+                "action_type": "grasp",
+                "target_name": "apple",
+            }
+        )
+
+        assert status == 503
+        assert "command dispatch is blocked" in response["msg"]
+        assert runtime.sessions == {}
+        assert runtime.commands == {}
+        assert runtime.command_queue.empty()
     finally:
         runtime.close()

@@ -59,6 +59,7 @@ image_broadcast_hz: 24
 ws_send_timeout_sec: 1.0
 jpeg_quality: 85
 policy_id: default
+command_queue_capacity: 256
 readiness:
   require_proprio_state: true
   require_images: true

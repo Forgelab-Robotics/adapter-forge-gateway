@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from forge_gateway.domain.commands import CommandMailboxUnavailable
+
 
 async def read_json(request: Request) -> dict[str, Any] | JSONResponse:
     try:
@@ -27,3 +29,7 @@ async def read_json(request: Request) -> dict[str, Any] | JSONResponse:
 
 def json_response(status_code: int, body: dict[str, Any]) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=body)
+
+
+def command_unavailable_response(error: CommandMailboxUnavailable) -> JSONResponse:
+    return json_response(503, {"ok": False, "msg": str(error)})

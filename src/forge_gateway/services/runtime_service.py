@@ -20,7 +20,12 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
 
 from forge_gateway.adapters.state_files import StateFileStore
 from forge_gateway.config import GatewayConfig
-from forge_gateway.domain.commands import Command, CommandState, map_policy_status
+from forge_gateway.domain.commands import (
+    Command,
+    CommandMailboxUnavailable,
+    CommandState,
+    map_policy_status,
+)
 from forge_gateway.domain.node_status import NodeStatus
 from forge_gateway.domain.sessions import SessionState, session_status_from_command
 from forge_gateway.services.action_registry import ActionRegistry
@@ -41,7 +46,11 @@ class GatewayRuntime:
             action_registry=self.action_registry,
         )
         self.lock = threading.Lock()
-        self.command_queue: queue.Queue[Command] = queue.Queue()
+        self._command_enqueue_lock = threading.Lock()
+        self.command_queue: queue.Queue[Command] = queue.Queue(
+            maxsize=config.command_queue_capacity
+        )
+        self.safety_command_queue: queue.Queue[Command] = queue.Queue()
         self.record_root: Path | None = None
         self.last_error: str | None = None
         self.dispatch_blocked_reason: str | None = None
@@ -92,24 +101,48 @@ class GatewayRuntime:
         tracked_command_id: str | None = None,
         retry_on_failure: bool = False,
         attempt: int = 0,
+        safety: bool = False,
     ) -> None:
-        self.command_queue.put(
-            Command(
-                kind="POLICY_COMMAND",
-                payload={
-                    "command": command,
-                    "inputs": dict(inputs or {}),
-                    "request_id": request_id,
-                    "policy_id": policy_id or self.config.policy_id,
-                },
-                tracked_command_id=tracked_command_id,
-                retry_on_failure=retry_on_failure,
-                attempt=attempt,
-            )
+        outbound = Command(
+            kind="POLICY_COMMAND",
+            payload={
+                "command": command,
+                "inputs": dict(inputs or {}),
+                "request_id": request_id,
+                "policy_id": policy_id or self.config.policy_id,
+            },
+            tracked_command_id=tracked_command_id,
+            retry_on_failure=retry_on_failure,
+            attempt=attempt,
         )
+        self._offer_command(outbound, safety=safety)
 
     def set_record_root(self, root: str | None) -> None:
-        self.command_queue.put(Command(kind="SET_ROOT", payload={"root": root}))
+        self._offer_command(Command(kind="SET_ROOT", payload={"root": root}))
+
+    def _offer_command(self, command: Command, *, safety: bool = False) -> None:
+        with self._command_enqueue_lock:
+            if self.dispatch_blocked_reason is not None and not safety:
+                raise CommandMailboxUnavailable(
+                    f"command dispatch is blocked: {self.dispatch_blocked_reason}"
+                )
+            if safety:
+                self.safety_command_queue.put_nowait(command)
+                return
+            try:
+                self.command_queue.put_nowait(command)
+            except queue.Full as error:
+                raise CommandMailboxUnavailable("command mailbox is full") from error
+
+    def take_next_command(self) -> Command | None:
+        with self._command_enqueue_lock:
+            try:
+                return self.safety_command_queue.get_nowait()
+            except queue.Empty:
+                try:
+                    return self.command_queue.get_nowait()
+                except queue.Empty:
+                    return None
 
     def command_dispatch_allowed(self) -> bool:
         with self.lock:
@@ -174,7 +207,10 @@ class GatewayRuntime:
             return 400, {"ok": False, "msg": "inputs must be an object"}
         # Agent-facing reset reuses the legacy runtime reset_scene command so
         # PAOS can stay on /agent/* while existing sim dataflows keep working.
-        self.enqueue_policy_command("reset_scene", inputs)
+        try:
+            self.enqueue_policy_command("reset_scene", inputs)
+        except CommandMailboxUnavailable as error:
+            return 503, {"ok": False, "msg": str(error)}
         return 202, {"ok": True, "data": {"command": "reset_scene", "inputs": inputs}}
 
     def create_agent_session(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -273,13 +309,20 @@ class GatewayRuntime:
             self.sessions[session_id] = session
             self.commands[command_id] = command_state
             self.active_session_id = session_id
-            self.enqueue_policy_command(
-                command,
-                policy_inputs,
-                request_id=command_id,
-                policy_id=policy_id,
-                tracked_command_id=command_id,
-            )
+            try:
+                self.enqueue_policy_command(
+                    command,
+                    policy_inputs,
+                    request_id=command_id,
+                    policy_id=policy_id,
+                    tracked_command_id=command_id,
+                )
+            except CommandMailboxUnavailable as error:
+                self.sessions.pop(session_id, None)
+                self.commands.pop(command_id, None)
+                if self.active_session_id == session_id:
+                    self.active_session_id = None
+                return 503, {"ok": False, "msg": str(error)}
             self._append_event_locked(
                 "session_created",
                 {"session": session.to_dict(), "command": command_state.to_dict()},
@@ -343,6 +386,7 @@ class GatewayRuntime:
                         request_id=f"cancel_{command.command_id}",
                         policy_id=command.policy_id,
                         retry_on_failure=True,
+                        safety=True,
                     )
             if cancellation_requested:
                 session.status = "cancelled"
