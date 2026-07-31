@@ -14,6 +14,8 @@ def register_agent_routes(app: FastAPI, runtime: Any) -> None:
     @app.post("/agent/sessions")
     async def agent_create_session(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         status_code, response = runtime.create_agent_session(body)
         return json_response(status_code, response)
 
@@ -42,5 +44,7 @@ def register_agent_routes(app: FastAPI, runtime: Any) -> None:
     @app.post("/agent/runtime/reset")
     async def agent_runtime_reset(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         status_code, response = runtime.agent_runtime_reset(body)
         return json_response(status_code, response)

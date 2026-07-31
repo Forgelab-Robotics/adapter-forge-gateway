@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
 
-async def read_json(request: Request) -> dict[str, Any]:
+async def read_json(request: Request) -> dict[str, Any] | JSONResponse:
     try:
         value = await request.json()
-    except Exception:
-        return {}
-    return value if isinstance(value, dict) else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return json_response(
+            400,
+            {"ok": False, "msg": "request body must be a JSON object"},
+        )
+    if not isinstance(value, dict):
+        return json_response(
+            400,
+            {"ok": False, "msg": "request body must be a JSON object"},
+        )
+    return value
 
 
 def json_response(status_code: int, body: dict[str, Any]) -> JSONResponse:

@@ -37,6 +37,8 @@ def register_runtime_routes(
     @app.post("/runtime/start")
     async def runtime_start(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         readiness = runtime.readiness()
         if not readiness["ready"]:
             return json_response(409, {"ok": False, "msg": "runtime is not ready", "data": readiness})
@@ -52,6 +54,8 @@ def register_runtime_routes(
     @app.post("/runtime/reset_scene")
     async def runtime_reset_scene(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         status_code, response = runtime.agent_runtime_reset(body)
         return json_response(200 if status_code == 202 else status_code, response)
 

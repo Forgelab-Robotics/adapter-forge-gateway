@@ -14,6 +14,8 @@ def register_record_routes(app: FastAPI, runtime: Any) -> None:
     @app.post("/record/control")
     async def record_control(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         action = body.get("action")
         commands = {
             "START": "start_recording",
@@ -36,6 +38,8 @@ def register_record_routes(app: FastAPI, runtime: Any) -> None:
     @app.post("/record/set_root")
     async def record_set_root(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         root = body.get("root")
         if not isinstance(root, str) or not root:
             return json_response(400, {"ok": False, "msg": "root must be non-empty string"})

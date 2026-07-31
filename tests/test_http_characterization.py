@@ -43,7 +43,7 @@ def _client(runtime: _Runtime) -> TestClient:
     return TestClient(app)
 
 
-def test_current_legacy_malformed_runtime_start_enqueues_default_start() -> None:
+def test_malformed_runtime_start_is_rejected_without_enqueuing() -> None:
     runtime = _Runtime()
 
     response = _client(runtime).post(
@@ -52,18 +52,31 @@ def test_current_legacy_malformed_runtime_start_enqueues_default_start() -> None
         headers={"content-type": "application/json"},
     )
 
-    assert response.status_code == 200
-    assert runtime.commands == [("start", {})]
+    assert response.status_code == 400
+    assert response.json() == {
+        "ok": False,
+        "msg": "request body must be a JSON object",
+    }
+    assert runtime.commands == []
 
 
-def test_current_legacy_non_object_runtime_start_enqueues_default_start() -> None:
+def test_non_object_runtime_start_is_rejected_without_enqueuing() -> None:
     runtime = _Runtime()
 
     for body in (None, [], "", 0, False):
         response = _client(runtime).post("/runtime/start", json=body)
-        assert response.status_code == 200
+        assert response.status_code == 400
 
-    assert runtime.commands == [("start", {})] * 5
+    assert runtime.commands == []
+
+
+def test_valid_empty_runtime_start_keeps_default_start_contract() -> None:
+    runtime = _Runtime()
+
+    response = _client(runtime).post("/runtime/start", json={})
+
+    assert response.status_code == 200
+    assert runtime.commands == [("start", {})]
 
 
 def test_current_readiness_gate_runs_before_request_validation() -> None:
@@ -79,7 +92,7 @@ def test_current_readiness_gate_runs_before_request_validation() -> None:
     assert runtime.commands == []
 
 
-def test_current_legacy_malformed_reset_body_triggers_reset_scene() -> None:
+def test_malformed_reset_body_is_rejected_without_enqueuing() -> None:
     runtime = _Runtime()
     client = _client(runtime)
 
@@ -89,5 +102,5 @@ def test_current_legacy_malformed_reset_body_triggers_reset_scene() -> None:
         headers={"content-type": "application/json"},
     )
 
-    assert response.status_code == 200
-    assert runtime.commands == [("reset_scene", {})]
+    assert response.status_code == 400
+    assert runtime.commands == []

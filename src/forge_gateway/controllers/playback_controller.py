@@ -14,6 +14,8 @@ def register_playback_routes(app: FastAPI, runtime: Any) -> None:
     @app.post("/playback/control")
     async def playback_control(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         action = body.get("action")
         command_map = {
             "START": "start_playback",

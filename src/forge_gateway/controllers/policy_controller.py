@@ -14,6 +14,8 @@ def register_policy_routes(app: FastAPI, runtime: Any) -> None:
     @app.post("/policy/command")
     async def policy_command(request: Request) -> JSONResponse:
         body = await read_json(request)
+        if isinstance(body, JSONResponse):
+            return body
         command = body.get("command")
         if not isinstance(command, str) or not command:
             return json_response(400, {"ok": False, "msg": "command must be non-empty string"})
