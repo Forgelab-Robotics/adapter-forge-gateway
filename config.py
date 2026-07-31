@@ -16,6 +16,10 @@ AgentActionConfig = _implementation.AgentActionConfig
 AgentConfig = _implementation.AgentConfig
 GatewayConfig = _implementation.GatewayConfig
 ReadinessConfig = _implementation.ReadinessConfig
+os = _implementation.os
+dataclass = _implementation.dataclass
+field = _implementation.field
+yaml = _implementation.yaml
 _clamp_hz = _implementation._clamp_hz
 _default_action_manifests = _implementation._default_action_manifests
 _load_action_manifest = _implementation._load_action_manifest
@@ -26,7 +30,21 @@ load_action_manifest = _implementation.load_action_manifest
 load_action_manifests = _implementation.load_action_manifests
 load_config = _implementation.load_config
 
-__all__ = [name for name in vars(_implementation) if not name.startswith("_")]
+__all__ = [
+    "AgentActionConfig",
+    "AgentConfig",
+    "GatewayConfig",
+    "ReadinessConfig",
+    "load_action_manifest",
+    "load_action_manifests",
+    "load_config",
+    "os",
+    "dataclass",
+    "field",
+    "Path",
+    "Any",
+    "yaml",
+]
 
 
 def __getattr__(name: str) -> Any:

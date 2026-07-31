@@ -6,6 +6,7 @@ import threading
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 
 from forge_gateway.controllers.record_controller import register_record_routes
 
@@ -39,11 +40,13 @@ class FakeRequest:
 def record_endpoint(runtime: FakeRuntime):
     app = FastAPI()
     register_record_routes(app, runtime)
-    return next(
-        route.endpoint
+    route = next(
+        route
         for route in app.routes
         if getattr(route, "path", None) == "/record/control"
     )
+    assert isinstance(route, APIRoute)
+    return route.endpoint
 
 
 def response_json(response: Any) -> dict[str, Any]:

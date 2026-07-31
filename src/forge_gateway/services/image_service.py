@@ -6,7 +6,10 @@ import base64
 import sys
 import threading
 from collections import deque
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable, cast
+
+if TYPE_CHECKING:
+    from forge_gateway.services.runtime_service import GatewayRuntime
 
 try:
     from forge_common import get_logger
@@ -47,7 +50,9 @@ def _image_payload(input_id: str, value: object, quality: int) -> dict[str, Any]
         elif img.encoding == "mono8" and frame.ndim == 3 and frame.shape[-1] == 1:
             frame = frame[:, :, 0]
         elif img.encoding in ("16UC1", "32FC1"):
-            frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype("uint8")
+            frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(  # pyright: ignore[reportArgumentType, reportCallIssue]
+                "uint8"
+            )
         ok, encoded = cv2.imencode(
             ".jpg",
             frame,
@@ -129,8 +134,16 @@ class ImageEncodeWorker:
             return input_id, value, timestamp
 
 
-def _payload_encoder():
+ImagePayloadEncoder = Callable[
+    [str, object, int],
+    dict[str, Any] | None,
+]
+
+
+def _payload_encoder() -> ImagePayloadEncoder:
     main_module = sys.modules.get("main")
     encoder = getattr(main_module, "_image_payload", None) if main_module is not None else None
-    return encoder if callable(encoder) and encoder is not _image_payload else _image_payload
+    if callable(encoder) and encoder is not _image_payload:
+        return cast(ImagePayloadEncoder, encoder)
+    return _image_payload
 
