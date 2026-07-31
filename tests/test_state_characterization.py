@@ -234,3 +234,31 @@ def test_dispatch_block_is_persisted_once_under_global_lock() -> None:
     finally:
         runtime.close()
         assert probe.calls[-1] == "snapshot"
+
+
+def test_terminal_dispatch_failure_only_updates_runtime_error() -> None:
+    runtime = _runtime()
+    probe = _LockProbeStore(runtime)
+    try:
+        _create_and_send(runtime, "terminal-failure")
+        runtime.apply_policy_command_status(_status("command-terminal-failure", "done"))
+        runtime.state_store = probe  # type: ignore[assignment]
+        with runtime.lock:
+            runtime.commands["command-terminal-failure"].dispatching = True
+
+        runtime.mark_command_dispatch_failed(
+            "command-terminal-failure",
+            RuntimeError("late send failure"),
+        )
+
+        assert probe.calls == []
+        with runtime.lock:
+            command = runtime.commands["command-terminal-failure"]
+            assert command.status == "succeeded"
+            assert command.dispatching is False
+            assert runtime.sessions["session-terminal-failure"].status == "succeeded"
+            assert runtime.active_session_id is None
+            assert runtime.last_error == "policy command dispatch failed: late send failure"
+    finally:
+        runtime.close()
+        assert probe.calls == ["snapshot"]

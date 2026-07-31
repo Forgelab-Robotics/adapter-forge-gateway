@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,15 +18,16 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
 
 from forge_gateway.adapters.state_files import StateFileStore
 from forge_gateway.config import GatewayConfig
-from forge_gateway.domain.commands import (
-    Command,
-    CommandMailboxUnavailable,
-    CommandState,
-    map_policy_status,
-)
+from forge_gateway.domain.commands import Command, CommandMailboxUnavailable, CommandState
 from forge_gateway.domain.node_status import NodeStatus
-from forge_gateway.domain.sessions import SessionState, session_status_from_command
+from forge_gateway.domain.sessions import SessionState
 from forge_gateway.services.action_registry import ActionRegistry
+from forge_gateway.services.agent_service import (
+    AgentEvent,
+    AgentService,
+    PolicyCommandStatusUpdate,
+    PreparedSession,
+)
 from forge_gateway.services.capability_service import CapabilityService
 from forge_gateway.services.command_service import CommandService
 from forge_gateway.services.image_service import ImageEncodeWorker
@@ -50,7 +50,12 @@ class GatewayRuntime:
             default_policy_id=config.policy_id,
             capacity=config.command_queue_capacity,
         )
-        # Keep these aliases while callers migrate to the service boundary.
+        self.agent_service = AgentService(
+            config=config.agent,
+            action_registry=self.action_registry,
+            command_sink=self.command_service,
+        )
+        # Keep these aliases while callers migrate to the command service boundary.
         self.command_queue = self.command_service.command_queue
         self.safety_command_queue = self.command_service.safety_command_queue
         self.record_root: Path | None = None
@@ -78,11 +83,7 @@ class GatewayRuntime:
         }
         self.state_ws_clients = 0
         self.image_ws_clients = 0
-        self.sessions: dict[str, SessionState] = {}
-        self.commands: dict[str, CommandState] = {}
         self.nodes: dict[str, NodeStatus] = {}
-        self.active_session_id: str | None = None
-        self.last_result: dict[str, Any] | None = None
         self.state_store = StateFileStore(
             config.agent.state_dir,
             write_context_snapshot=config.agent.write_context_snapshot,
@@ -95,6 +96,40 @@ class GatewayRuntime:
     @property
     def dispatch_blocked_reason(self) -> str | None:
         return self.command_service.dispatch_blocked_reason
+
+    @property
+    def sessions(self) -> dict[str, SessionState]:
+        return self.agent_service.sessions
+
+    @sessions.setter
+    def sessions(self, value: dict[str, SessionState]) -> None:
+        self.agent_service.sessions = value
+
+    @property
+    def commands(self) -> dict[str, CommandState]:
+        return self.agent_service.commands
+
+    @commands.setter
+    def commands(self, value: dict[str, CommandState]) -> None:
+        self.agent_service.commands = value
+
+    @property
+    def active_session_id(self) -> str | None:
+        return self.agent_service.active_session_id
+
+    @active_session_id.setter
+    def active_session_id(self, value: str | None) -> None:
+        self.agent_service.active_session_id = value
+
+    @property
+    def last_result(self) -> dict[str, Any] | None:
+        return self.agent_service.last_result
+
+    @last_result.setter
+    def last_result(self, value: dict[str, Any] | None) -> None:
+        self.agent_service.last_result = value
+
+
 
     def enqueue_policy_command(
         self,
@@ -193,308 +228,81 @@ class GatewayRuntime:
         return 202, {"ok": True, "data": {"command": "reset_scene", "inputs": inputs}}
 
     def create_agent_session(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        if not self.config.agent.enabled:
-            return 404, {"ok": False, "msg": "agent API is disabled"}
-
-        now = time.time()
-        action_type = body.get("action_type") or body.get("action") or body.get("type") or body.get("command")
-        if not isinstance(action_type, str) or not action_type:
-            return 400, {"ok": False, "msg": "action_type must be non-empty string"}
-
-        inputs_raw = body.get("inputs", body.get("parameters", {}))
-        if inputs_raw is None:
-            inputs_raw = {}
-        if not isinstance(inputs_raw, dict):
-            return 400, {"ok": False, "msg": "inputs must be an object"}
-
-        source_inputs = dict(inputs_raw)
-        for key in ("target", "target_name", "instruction"):
-            if key in body and key not in source_inputs:
-                source_inputs[key] = body[key]
-
-        action_cfg = self.action_registry.get(action_type)
-        if action_cfg is None:
-            return 400, {
-                "ok": False,
-                "msg": f"unknown action_type: {action_type}",
-                "data": {"supported_actions": self.action_registry.supported_action_names()},
-            }
-        command = action_cfg.command
-        policy_id = action_cfg.policy_id
-        policy_inputs = dict(source_inputs)
-        for src_key, dst_key in action_cfg.input_mapping.items():
-            if src_key in source_inputs and dst_key not in policy_inputs:
-                policy_inputs[dst_key] = source_inputs[src_key]
-        missing = [
-            key
-            for key in action_cfg.required_parameters
-            if key not in policy_inputs or policy_inputs[key] in (None, "")
-        ]
-        if missing:
-            return 400, {"ok": False, "msg": f"missing required inputs: {', '.join(missing)}"}
-
-        session_id = str(body.get("session_id") or f"session_{uuid.uuid4().hex[:12]}")
-        command_id = str(body.get("command_id") or f"command_{uuid.uuid4().hex[:12]}")
-        instruction = str(body.get("instruction") or source_inputs.get("instruction") or "")
-        source = str(body.get("source") or "paos-agent")
-        target = policy_inputs.get("target_name") or policy_inputs.get("target")
-        target_value = str(target) if target is not None else None
-        policy_inputs.update(
-            {
-                "session_id": session_id,
-                "command_id": command_id,
-                "action_type": action_type,
-                "source": source,
-            }
-        )
-        policy_inputs["policy_id"] = policy_id
-        if instruction:
-            policy_inputs["instruction"] = instruction
-
+        prepared = self.agent_service.prepare_create(body, now=time.time())
+        if not isinstance(prepared, PreparedSession):
+            return prepared
         with self.lock:
-            if session_id in self.sessions:
-                return 409, {"ok": False, "msg": f"session already exists: {session_id}"}
-            if command_id in self.commands:
-                return 409, {"ok": False, "msg": f"command already exists: {command_id}"}
-            active_count = sum(
-                1 for session in self.sessions.values() if session.status in ("queued", "running")
-            )
-            if active_count >= self.config.agent.max_active_sessions:
-                return 409, {"ok": False, "msg": "another agent session is active", "data": {"active_session_id": self.active_session_id}}
-
-            session = SessionState(
-                session_id=session_id,
-                status="queued",
-                action_type=action_type,
-                instruction=instruction,
-                source=source,
-                target=target_value,
-                command_ids=[command_id],
-                created_at=now,
-                updated_at=now,
-            )
-            command_state = CommandState(
-                command_id=command_id,
-                session_id=session_id,
-                policy_id=policy_id,
-                command=command,
-                action_type=action_type,
-                inputs=dict(policy_inputs),
-                status="queued",
-                request_id=command_id,
-                created_at=now,
-                updated_at=now,
-            )
-            self.sessions[session_id] = session
-            self.commands[command_id] = command_state
-            self.active_session_id = session_id
-            try:
-                self.enqueue_policy_command(
-                    command,
-                    policy_inputs,
-                    request_id=command_id,
-                    policy_id=policy_id,
-                    tracked_command_id=command_id,
-                )
-            except CommandMailboxUnavailable as error:
-                self.sessions.pop(session_id, None)
-                self.commands.pop(command_id, None)
-                if self.active_session_id == session_id:
-                    self.active_session_id = None
-                return 503, {"ok": False, "msg": str(error)}
-            self._append_event_locked(
-                "session_created",
-                {"session": session.to_dict(), "command": command_state.to_dict()},
-                now=now,
-            )
-            self._write_snapshot_locked(now)
-
-        return 202, {
-            "ok": True,
-            "data": {
-                "session": session.to_dict(),
-                "command": command_state.to_dict(),
-                "status": session.status,
-            },
-        }
+            result, event = self.agent_service.create_session_locked(prepared)
+            if event is not None:
+                self._persist_agent_event_locked(event)
+        return result
 
     def get_agent_session(self, session_id: str) -> tuple[int, dict[str, Any]]:
         with self.lock:
-            session = self.sessions.get(session_id)
-            if session is None:
-                return 404, {"ok": False, "msg": f"session not found: {session_id}"}
-            return 200, {
-                "ok": True,
-                "data": {
-                    "session": session.to_dict(),
-                    "commands": [
-                        self.commands[command_id].to_dict()
-                        for command_id in session.command_ids
-                        if command_id in self.commands
-                    ],
-                },
-            }
+            return self.agent_service.get_session_locked(session_id)
 
     def cancel_agent_session(self, session_id: str) -> tuple[int, dict[str, Any]]:
         now = time.time()
-        cancellation_requested = False
         with self.lock:
-            session = self.sessions.get(session_id)
-            if session is None:
-                return 404, {"ok": False, "msg": f"session not found: {session_id}"}
-            for command_id in session.command_ids:
-                command = self.commands.get(command_id)
-                if command is None or command.status not in ("queued", "sent", "running"):
-                    continue
-                previous_status = command.status
-                cancellation_requested = True
-                command.status = "cancelled"
-                command.updated_at = now
-                command.message = "cancel requested by agent"
-                if previous_status in ("sent", "running") or command.dispatching:
-                    self.enqueue_policy_command(
-                        "stop",
-                        {
-                            "session_id": session_id,
-                            "command_id": f"cancel_{command.command_id}",
-                            "cancelled_command_id": command.command_id,
-                            "action_type": command.action_type,
-                            "source": "paos-agent",
-                            "reason": "agent_cancel",
-                        },
-                        request_id=f"cancel_{command.command_id}",
-                        policy_id=command.policy_id,
-                        retry_on_failure=True,
-                        safety=True,
-                    )
-            if cancellation_requested:
-                session.status = "cancelled"
-                session.updated_at = now
-                session.message = "cancel requested by agent"
-                if self.active_session_id == session_id:
-                    self.active_session_id = None
-                self._append_event_locked(
-                    "session_cancelled",
-                    {"session_id": session_id},
-                    now=now,
-                )
-                self._write_snapshot_locked(now)
-            response_status = session.status
-
-        return 200, {
-            "ok": True,
-            "data": {"session_id": session_id, "status": response_status},
-        }
+            result, event = self.agent_service.cancel_session_locked(
+                session_id,
+                now=now,
+            )
+            if event is not None:
+                self._persist_agent_event_locked(event)
+        return result
 
     def claim_command_dispatch(self, command_id: str | None) -> bool:
         if not command_id:
             return True
         with self.lock:
-            command = self.commands.get(command_id)
-            if command is None or command.status != "queued" or command.dispatching:
-                return False
-            command.dispatching = True
-            return True
+            return self.agent_service.claim_command_dispatch_locked(command_id)
 
     def mark_command_sent(self, command_id: str) -> None:
         if not command_id:
             return
         now = time.time()
         with self.lock:
-            command = self.commands.get(command_id)
-            if command is None:
-                return
-            command.dispatching = False
-            if command.status != "queued":
-                return
-            command.status = "sent"
-            command.sent_at = now
-            command.updated_at = now
-            session = self.sessions.get(command.session_id)
-            if session is not None and session.status == "queued":
-                session.status = "running"
-                session.updated_at = now
-            self._append_event_locked("command_sent", {"command_id": command_id}, now=now)
-            self._write_snapshot_locked(now)
+            event = self.agent_service.mark_command_sent_locked(
+                command_id,
+                now=now,
+            )
+            if event is not None:
+                self._persist_agent_event_locked(event)
 
     def mark_command_dispatch_failed(self, command_id: str, error: Exception) -> None:
         now = time.time()
         message = f"policy command dispatch failed: {error}"
         with self.lock:
             self.last_error = message
-            command = self.commands.get(command_id)
-            if command is None:
-                self._append_event_locked(
-                    "command_dispatch_failed",
-                    {"command_id": command_id, "error": str(error)},
-                    now=now,
-                )
-                self._write_snapshot_locked(now)
-                return
-            command.dispatching = False
-            if command.status in ("succeeded", "failed", "cancelled"):
-                return
-            command.status = "failed"
-            command.updated_at = now
-            command.message = message
-            session = self.sessions.get(command.session_id)
-            if session is not None and session.status not in ("succeeded", "failed", "cancelled"):
-                session.status = "failed"
-                session.updated_at = now
-                session.message = message
-                if self.active_session_id == session.session_id:
-                    self.active_session_id = None
-            self._append_event_locked(
-                "command_dispatch_failed",
-                {"command_id": command_id, "error": str(error)},
+            event = self.agent_service.mark_command_dispatch_failed_locked(
+                command_id,
+                message=message,
+                error_text=str(error),
                 now=now,
             )
-            self._write_snapshot_locked(now)
+            if event is not None:
+                self._persist_agent_event_locked(event)
 
     def apply_policy_command_status(self, value: object) -> None:
         from forge_msgs import PolicyCommandStatus
 
         status_msg = PolicyCommandStatus.from_arrow(value)  # type: ignore[arg-type]
-        outputs = status_msg.outputs()
-        command_id = status_msg.request_id
+        update = PolicyCommandStatusUpdate(
+            policy_id=status_msg.policy_id,
+            command=status_msg.command,
+            request_id=status_msg.request_id,
+            status=status_msg.status,
+            message=status_msg.message,
+            outputs=dict(status_msg.outputs()),
+        )
         now = time.time()
         with self.lock:
-            command = self.commands.get(command_id)
-            mapped_status = map_policy_status(status_msg.status)
-            if command is not None:
-                identity_matches = (
-                    status_msg.policy_id == command.policy_id
-                    and status_msg.command == command.command
-                )
-                mutable_status = command.status in ("sent", "running")
-                if identity_matches and mutable_status:
-                    command.status = mapped_status
-                    command.updated_at = now
-                    command.message = status_msg.message
-                    command.outputs = outputs
-                    session = self.sessions.get(command.session_id)
-                    if session is not None and session.status in ("queued", "running"):
-                        session.status = session_status_from_command(mapped_status)
-                        session.updated_at = now
-                        session.message = status_msg.message
-                        if (
-                            session.status in ("succeeded", "failed", "cancelled")
-                            and self.active_session_id == session.session_id
-                        ):
-                            self.active_session_id = None
-                elif identity_matches and command.status == "cancelled":
-                    command.updated_at = now
-                    command.outputs = outputs
-            self.last_result = {
-                "policy_id": status_msg.policy_id,
-                "command": status_msg.command,
-                "request_id": status_msg.request_id,
-                "status": status_msg.status,
-                "message": status_msg.message,
-                "outputs": outputs,
-            }
-            self._append_event_locked("policy_command_status", dict(self.last_result), now=now)
-            self._write_snapshot_locked(now)
+            event = self.agent_service.apply_policy_command_status_locked(
+                update,
+                now=now,
+            )
+            self._persist_agent_event_locked(event)
 
     def latest_image_updates_since(self, cursors: dict[str, int]) -> list[dict[str, Any]]:
         """Return only the newest image payload per stream since each client cursor."""
@@ -594,6 +402,10 @@ class GatewayRuntime:
                 "playback_status": dict(self.playback_status),
             },
         }
+
+    def _persist_agent_event_locked(self, event: AgentEvent) -> None:
+        self._append_event_locked(event.event_type, event.data, now=event.now)
+        self._write_snapshot_locked(event.now)
 
     def _append_event_locked(self, event_type: str, data: dict[str, Any], *, now: float) -> None:
         self.state_store.append_event(event_type, data, now=now)
