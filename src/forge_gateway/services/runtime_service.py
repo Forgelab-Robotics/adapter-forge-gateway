@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
 import uuid
@@ -30,6 +29,7 @@ from forge_gateway.domain.node_status import NodeStatus
 from forge_gateway.domain.sessions import SessionState, session_status_from_command
 from forge_gateway.services.action_registry import ActionRegistry
 from forge_gateway.services.capability_service import CapabilityService
+from forge_gateway.services.command_service import CommandService
 from forge_gateway.services.image_service import ImageEncodeWorker
 
 logger = get_logger(__name__)
@@ -46,14 +46,15 @@ class GatewayRuntime:
             action_registry=self.action_registry,
         )
         self.lock = threading.Lock()
-        self._command_enqueue_lock = threading.Lock()
-        self.command_queue: queue.Queue[Command] = queue.Queue(
-            maxsize=config.command_queue_capacity
+        self.command_service = CommandService(
+            default_policy_id=config.policy_id,
+            capacity=config.command_queue_capacity,
         )
-        self.safety_command_queue: queue.Queue[Command] = queue.Queue()
+        # Keep these aliases while callers migrate to the service boundary.
+        self.command_queue = self.command_service.command_queue
+        self.safety_command_queue = self.command_service.safety_command_queue
         self.record_root: Path | None = None
         self.last_error: str | None = None
-        self.dispatch_blocked_reason: str | None = None
         self.start_time = time.time()
         self.current_frame_count = 0
         self.proprio_state: dict[str, float] = {}
@@ -91,6 +92,10 @@ class GatewayRuntime:
         self.snapshot_path: Path | None = self.state_store.snapshot_path
         self.image_encoder = ImageEncodeWorker(self)
 
+    @property
+    def dispatch_blocked_reason(self) -> str | None:
+        return self.command_service.dispatch_blocked_reason
+
     def enqueue_policy_command(
         self,
         command: str,
@@ -103,58 +108,32 @@ class GatewayRuntime:
         attempt: int = 0,
         safety: bool = False,
     ) -> None:
-        outbound = Command(
-            kind="POLICY_COMMAND",
-            payload={
-                "command": command,
-                "inputs": dict(inputs or {}),
-                "request_id": request_id,
-                "policy_id": policy_id or self.config.policy_id,
-            },
+        self.command_service.enqueue_policy_command(
+            command,
+            inputs,
+            request_id=request_id,
+            policy_id=policy_id,
             tracked_command_id=tracked_command_id,
             retry_on_failure=retry_on_failure,
             attempt=attempt,
+            safety=safety,
         )
-        self._offer_command(outbound, safety=safety)
 
     def set_record_root(self, root: str | None) -> None:
-        self._offer_command(Command(kind="SET_ROOT", payload={"root": root}))
-
-    def _offer_command(self, command: Command, *, safety: bool = False) -> None:
-        with self._command_enqueue_lock:
-            if self.dispatch_blocked_reason is not None and not safety:
-                raise CommandMailboxUnavailable(
-                    f"command dispatch is blocked: {self.dispatch_blocked_reason}"
-                )
-            if safety:
-                self.safety_command_queue.put_nowait(command)
-                return
-            try:
-                self.command_queue.put_nowait(command)
-            except queue.Full as error:
-                raise CommandMailboxUnavailable("command mailbox is full") from error
+        self.command_service.set_record_root(root)
 
     def take_next_command(self) -> Command | None:
-        with self._command_enqueue_lock:
-            try:
-                return self.safety_command_queue.get_nowait()
-            except queue.Empty:
-                try:
-                    return self.command_queue.get_nowait()
-                except queue.Empty:
-                    return None
+        return self.command_service.take_next_command()
 
     def command_dispatch_allowed(self) -> bool:
-        with self.lock:
-            return self.dispatch_blocked_reason is None
+        return self.command_service.command_dispatch_allowed()
 
     def block_command_dispatch(self, error: Exception) -> None:
         now = time.time()
         reason = f"safety command dispatch exhausted retries: {error}"
         with self.lock:
-            if self.dispatch_blocked_reason is not None:
+            if not self.command_service.block_command_dispatch(reason):
                 return
-            self.dispatch_blocked_reason = reason
             self.last_error = reason
             self._append_event_locked(
                 "command_dispatch_blocked",

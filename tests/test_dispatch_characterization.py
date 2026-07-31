@@ -388,3 +388,26 @@ def test_blocked_dispatch_rejects_new_session_without_state_artifacts() -> None:
         assert runtime.command_queue.empty()
     finally:
         runtime.close()
+
+
+def test_dequeue_rechecks_dispatch_gate_after_allowed_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    try:
+        runtime.enqueue_policy_command("must-not-send")
+        node = _CapturingNode()
+
+        def allow_then_block() -> bool:
+            runtime.command_service.block_command_dispatch("blocked between check and dequeue")
+            return True
+
+        monkeypatch.setattr(runtime.command_service, "command_dispatch_allowed", allow_then_block)
+
+        drain_commands(runtime, node)
+
+        assert node.attempts == []
+        assert runtime.command_queue.qsize() == 1
+        assert runtime.dispatch_blocked_reason == "blocked between check and dequeue"
+    finally:
+        runtime.close()

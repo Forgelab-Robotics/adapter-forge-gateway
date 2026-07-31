@@ -215,3 +215,22 @@ def test_current_legacy_persistence_callbacks_run_under_global_lock() -> None:
     finally:
         runtime.close()
         assert probe.calls[-1] == "snapshot"
+
+
+def test_dispatch_block_is_persisted_once_under_global_lock() -> None:
+    runtime = _runtime()
+    probe = _LockProbeStore(runtime)
+    runtime.state_store = probe  # type: ignore[assignment]
+    try:
+        runtime.block_command_dispatch(RuntimeError("first failure"))
+        runtime.block_command_dispatch(RuntimeError("second failure"))
+
+        assert probe.calls == ["event:command_dispatch_blocked", "snapshot"]
+        with runtime.lock:
+            assert runtime.dispatch_blocked_reason == (
+                "safety command dispatch exhausted retries: first failure"
+            )
+            assert runtime.last_error == runtime.dispatch_blocked_reason
+    finally:
+        runtime.close()
+        assert probe.calls[-1] == "snapshot"
