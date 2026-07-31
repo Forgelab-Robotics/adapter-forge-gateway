@@ -26,7 +26,13 @@ from forge_gateway.adapters.dora_adapter import (
 
 logger = get_logger("forge_gateway.cli")
 
-DoraRunReason = Literal["stop", "error", "eof", "shutdown"]
+DoraRunReason = Literal[
+    "stop",
+    "error",
+    "reader_error",
+    "eof",
+    "shutdown",
+]
 
 
 class DoraNodeLike(Protocol):
@@ -52,24 +58,37 @@ class GatewayDoraRunner:
         self._poll_timeout = poll_timeout
         self._events = DoraEventBuffer()
         self._end_sentinel = object()
+        self._reader_started = threading.Event()
+        self._reader_error_lock = threading.Lock()
+        self._reader_error: BaseException | None = None
         self._reader_thread = threading.Thread(
             target=self._read_node,
             name="gateway_dora_iter",
             daemon=True,
         )
 
+    @property
+    def reader_error(self) -> BaseException | None:
+        with self._reader_error_lock:
+            return self._reader_error
+
     def start(self) -> None:
         self._reader_thread.start()
+        if not self._reader_started.wait(timeout=1.0):
+            raise RuntimeError("Dora reader thread did not start")
 
     def run(self) -> DoraRunReason:
-        while not self._stop_event.is_set():
+        while True:
+            if self._apply_reader_error():
+                return "reader_error"
+            if self._stop_event.is_set():
+                return "reader_error" if self._apply_reader_error() else "shutdown"
             event = self._events.get(timeout=self._poll_timeout)
             if event is self._end_sentinel:
                 return "eof"
             reason = self.handle_poll(cast(dict[str, Any] | None, event))
             if reason is not None:
                 return reason
-        return "shutdown"
 
     def handle_poll(self, event: dict[str, Any] | None) -> DoraRunReason | None:
         """Process one event-buffer poll result; ``None`` represents a timeout."""
@@ -84,6 +103,9 @@ class GatewayDoraRunner:
             with self._runtime.lock:
                 self._runtime.last_error = f"dora error: {event.get('error', 'unknown')}"
             return "error"
+        if event_type == "READER_ERROR":
+            self._apply_reader_error()
+            return "reader_error"
         if event_type == "INPUT":
             try:
                 handle_dora_input(
@@ -110,14 +132,25 @@ class GatewayDoraRunner:
             self._reader_thread.join(timeout=timeout)
         return not self._reader_thread.is_alive()
 
+    def _apply_reader_error(self) -> bool:
+        error = self.reader_error
+        if error is None:
+            return False
+        with self._runtime.lock:
+            self._runtime.last_error = f"dora reader failed: {error}"
+        return True
+
     def _read_node(self) -> None:
+        self._reader_started.set()
         try:
             for event in self._node:
                 if self._stop_event.is_set():
                     break
                 self._events.put(event)
-        except Exception as error:
+        except BaseException as error:
+            with self._reader_error_lock:
+                self._reader_error = error
             logger.exception("gateway: dora iteration failed: %s", error)
-            self._events.put({"type": "ERROR", "error": str(error)})
+            self._events.put({"type": "READER_ERROR", "error": str(error)})
         finally:
             self._events.put(self._end_sentinel)

@@ -45,6 +45,18 @@ uv run gateway --help
 
 构建脚本使用临时 `.venv_build` 环境，将产物写入 `dist/gateway`，并在完成后执行 `dist/gateway --help` 验证入口。
 
+## 应用生命周期
+
+`GatewayApplication` 统一管理 Runtime、Dora reader、launcher watcher 和 Uvicorn：
+
+- Dora Node/runner 在 HTTP 端口开放前完成初始化。
+- Uvicorn 必须完成端口绑定 handshake；端口占用或后台线程提前退出会触发启动回滚。
+- `SIGINT`、`SIGTERM`、launcher 消失和 `/runtime/stop` 都进入同一 shutdown 路径。
+- shutdown 首先关闭 command/image admission，再停止 HTTP/Dora ingress，最后执行 Runtime close barrier。
+- cleanup 会尝试所有已获取的组件；超时或异常通过结构化结果返回，未完成的 close 可以重试。
+
+线程 join 使用统一的 application budget；Runtime 自身仍使用独立的 dispatch/image cleanup budget。如果底层 Dora iterator 永久阻塞，Gateway 会报告 shutdown incomplete 并以非零状态退出，而不会把它误报为正常关闭。
+
 ## 配置
 
 ```yaml

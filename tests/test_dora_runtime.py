@@ -226,16 +226,18 @@ def test_control_event_overtakes_pending_coalesced_input(
         runtime.close()
 
 
-def test_reader_exception_is_reported_before_eof() -> None:
+def test_reader_exception_is_durable_across_shutdown_race() -> None:
     runtime = _runtime()
-    runner = _runner(runtime, _FailingNode())
+    stop_event = threading.Event()
+    runner = _runner(runtime, _FailingNode(), stop_event=stop_event)
     try:
         runner.start()
-
-        assert runner.run() == "error"
         assert runner.join_reader(timeout=1.0)
+        stop_event.set()
+
+        assert runner.run() == "reader_error"
         with runtime.lock:
-            assert runtime.last_error == "dora error: reader failed"
+            assert runtime.last_error == "dora reader failed: reader failed"
     finally:
         runtime.close()
 

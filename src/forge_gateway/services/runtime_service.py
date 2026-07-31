@@ -426,6 +426,14 @@ class GatewayRuntime:
         with self.lock:
             return self._readiness_locked(time.time())
 
+    def begin_close(self) -> None:
+        """Atomically reject new command and image admission before final cleanup."""
+        with self.lock:
+            if self._phase != "running":
+                return
+            self.image_encoder.reject_submissions()
+            self._phase = "closing"
+
     def close(self) -> bool:
         owner = False
         with self.lock:
@@ -436,8 +444,9 @@ class GatewayRuntime:
                 if attempt is None:
                     raise RuntimeError("gateway close attempt is missing")
             else:
-                self.image_encoder.reject_submissions()
-                self._phase = "closing"
+                if self._phase == "running":
+                    self.image_encoder.reject_submissions()
+                    self._phase = "closing"
                 self._close_in_progress = True
                 attempt = _CloseAttempt()
                 self._close_attempt = attempt
