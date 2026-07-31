@@ -35,17 +35,25 @@ class ReadinessConfig:
     require_images: bool = True
     require_state_client: bool = False
     require_image_client: bool = False
+    proprio_stale_after_sec: float | None = 2.0
     image_stale_after_sec: float = 2.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ReadinessConfig":
         if not data:
             return cls()
+        proprio_stale_raw = data.get("proprio_stale_after_sec", 2.0)
+        proprio_stale_after_sec = (
+            None
+            if proprio_stale_raw is None
+            else max(0.1, float(proprio_stale_raw))
+        )
         return cls(
             require_proprio_state=bool(data.get("require_proprio_state", True)),
             require_images=bool(data.get("require_images", True)),
             require_state_client=bool(data.get("require_state_client", False)),
             require_image_client=bool(data.get("require_image_client", False)),
+            proprio_stale_after_sec=proprio_stale_after_sec,
             image_stale_after_sec=max(0.1, float(data.get("image_stale_after_sec", 2.0))),
         )
 

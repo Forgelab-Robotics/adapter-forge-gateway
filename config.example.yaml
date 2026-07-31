@@ -36,6 +36,7 @@ readiness:
   require_images: true          # true 时，所有 image_input_ids 都收到新图像后才允许启动。
   require_state_client: false   # true 时，必须有状态 WebSocket 客户端连接后才允许启动。
   require_image_client: false   # true 时，必须有图像 WebSocket 客户端连接后才允许启动。
+  proprio_stale_after_sec: 2.0  # 本体状态超过该秒数未更新则视为未就绪；设为 null 保留 presence-only 兼容模式。
   image_stale_after_sec: 2.0    # 图像超过该秒数未更新则视为未就绪，最小 0.1。
 
 # PAOS Agent-facing Gateway MVP+ 配置。

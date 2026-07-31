@@ -501,14 +501,33 @@ class GatewayRuntime:
         cfg = self.config.readiness
         missing: list[str] = []
 
-        proprio_ready = self.latest_proprio_time is not None
+        proprio_age = (
+            None
+            if self.latest_proprio_time is None
+            else now - self.latest_proprio_time
+        )
+        proprio_ready = (
+            proprio_age is not None
+            and (
+                cfg.proprio_stale_after_sec is None
+                or 0.0 <= proprio_age <= cfg.proprio_stale_after_sec
+            )
+        )
         if cfg.require_proprio_state and not proprio_ready:
             missing.append("proprio_state")
 
         image_status: dict[str, bool] = {}
         for image_id in self.config.image_input_ids:
             payload = self.images.get(image_id)
-            ready = bool(payload) and (now - float(payload["timestamp"]) <= cfg.image_stale_after_sec)
+            image_age = (
+                None
+                if not payload
+                else now - float(payload["timestamp"])
+            )
+            ready = (
+                image_age is not None
+                and 0.0 <= image_age <= cfg.image_stale_after_sec
+            )
             image_status[image_id] = ready
         images_ready = all(image_status.values()) if self.config.image_input_ids else True
         if cfg.require_images and not images_ready:

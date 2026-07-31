@@ -72,8 +72,28 @@ def _status(
     ).to_arrow()
 
 
-def test_current_legacy_proprioception_never_becomes_stale() -> None:
+def test_proprioception_becomes_stale_by_default() -> None:
     runtime = _runtime()
+    try:
+        with runtime.lock:
+            runtime.latest_proprio_time = 1.0
+            readiness = runtime._readiness_locked(1_000_000.0)
+
+        assert readiness["ready"] is False
+        assert readiness["proprio_state_ready"] is False
+        assert "proprio_state" in readiness["missing"]
+    finally:
+        runtime.close()
+
+
+def test_explicit_null_proprio_timeout_keeps_presence_only_compatibility() -> None:
+    cfg = config.GatewayConfig.from_dict(
+        {
+            "joint_order": ["j1"],
+            "readiness": {"proprio_stale_after_sec": None},
+        }
+    )
+    runtime = GatewayRuntime(cfg)
     try:
         with runtime.lock:
             runtime.latest_proprio_time = 1.0
@@ -81,12 +101,11 @@ def test_current_legacy_proprioception_never_becomes_stale() -> None:
 
         assert readiness["ready"] is True
         assert readiness["proprio_state_ready"] is True
-        assert "proprio_state" not in readiness["missing"]
     finally:
         runtime.close()
 
 
-def test_current_legacy_future_image_timestamp_counts_as_ready() -> None:
+def test_future_image_timestamp_is_not_ready() -> None:
     cfg = config.GatewayConfig.from_dict(
         {
             "joint_order": ["j1"],
@@ -100,8 +119,8 @@ def test_current_legacy_future_image_timestamp_counts_as_ready() -> None:
             runtime.images["image/front"] = {"timestamp": 1_000.0}
             readiness = runtime._readiness_locked(100.0)
 
-        assert readiness["ready"] is True
-        assert readiness["images"] == {"image/front": True}
+        assert readiness["ready"] is False
+        assert readiness["images"] == {"image/front": False}
     finally:
         runtime.close()
 

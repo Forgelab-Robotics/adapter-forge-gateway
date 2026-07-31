@@ -64,6 +64,7 @@ readiness:
   require_images: true
   require_state_client: false
   require_image_client: false
+  proprio_stale_after_sec: 2.0  # 设为 null 可显式使用旧的 presence-only 行为
   image_stale_after_sec: 2.0
 ```
 

@@ -37,6 +37,7 @@ actions:
                     "require_proprio_state": True,
                     "require_images": True,
                     "require_state_client": True,
+                    "proprio_stale_after_sec": 3.0,
                     "image_stale_after_sec": 1.5,
                 },
                 "agent": {
@@ -55,6 +56,7 @@ actions:
     assert cfg.port == 9002
     assert cfg.ws_send_timeout_sec == 0.5
     assert cfg.readiness.require_state_client is True
+    assert cfg.readiness.proprio_stale_after_sec == 3.0
     assert cfg.readiness.image_stale_after_sec == 1.5
     assert cfg.agent.max_active_sessions == 1
     assert cfg.agent.actions["grasp"].policy_id == "sam3"
