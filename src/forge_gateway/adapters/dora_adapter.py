@@ -8,7 +8,7 @@ from dataclasses import replace
 import time
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Never
 
 if TYPE_CHECKING:
     from forge_gateway.services.runtime_service import GatewayRuntime
@@ -96,11 +96,30 @@ def handle_dora_input(runtime: GatewayRuntime, input_id: str, value: object) -> 
 
     if input_id == "proprio_state":
         joint_state = JointState.from_arrow(value)  # type: ignore[arg-type]
+        if not any((joint_state.position, joint_state.velocity, joint_state.effort)):
+            _reject_proprio_state(
+                runtime,
+                joint_state.name,
+                now=now,
+                reason="proprio_state has no position, velocity, or effort values",
+            )
         joints = _ordered(_joint_values_by_name(joint_state), runtime.config.joint_order)
+        if not joints:
+            _reject_proprio_state(
+                runtime,
+                joint_state.name,
+                now=now,
+                reason="proprio_state does not contain any configured joints",
+            )
         with runtime.lock:
             runtime.proprio_state = joints
             runtime.latest_proprio_time = now
-            runtime.nodes["proprio_state"] = NodeStatus("proprio_state", "ready", now, {"joint_count": len(joints)})
+            runtime.nodes["proprio_state"] = NodeStatus(
+                "proprio_state",
+                "ready",
+                now,
+                {"joint_count": len(joints)},
+            )
         return
 
     if input_id == "action":
@@ -142,6 +161,26 @@ def handle_dora_input(runtime: GatewayRuntime, input_id: str, value: object) -> 
 
     if input_id in runtime.config.image_input_ids:
         runtime.image_encoder.submit(input_id, value, now)
+
+
+def _reject_proprio_state(
+    runtime: GatewayRuntime,
+    received_joints: list[str],
+    *,
+    now: float,
+    reason: str,
+) -> Never:
+    with runtime.lock:
+        runtime.nodes["proprio_state"] = NodeStatus(
+            "proprio_state",
+            "error",
+            now,
+            {
+                "error": reason,
+                "received_joints": list(received_joints),
+            },
+        )
+    raise ValueError(reason)
 
 
 def _json_bytes(value: object) -> Any:

@@ -61,6 +61,7 @@ def test_readiness_passes_when_required_signals_arrive() -> None:
     try:
         now = time.time()
         with runtime.lock:
+            runtime.proprio_state = {"j1": 0.0}
             runtime.latest_proprio_time = now
             runtime.images["image/front"] = {"seq": 1, "timestamp": now}
 
@@ -362,7 +363,21 @@ def test_cancel_agent_session_sends_policy_stop() -> None:
         runtime.close()
 
 
-def test_main_print_capabilities_without_joint_order(
+def test_main_print_capabilities_without_config(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GATEWAY_CONFIG", raising=False)
+    monkeypatch.setattr(sys, "argv", ["gateway", "--print-capabilities"])
+
+    assert cli.main() == 0
+
+    capabilities = json.loads(capsys.readouterr().out)
+    assert capabilities["policy_id"] == "default"
+    assert "grasp" in capabilities["actions"]
+
+
+def test_main_print_capabilities_from_example_config(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:

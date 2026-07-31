@@ -338,7 +338,8 @@ class GatewayRuntime:
             else now - self.latest_proprio_time
         )
         proprio_ready = (
-            proprio_age is not None
+            bool(self.proprio_state)
+            and proprio_age is not None
             and (
                 cfg.proprio_stale_after_sec is None
                 or 0.0 <= proprio_age <= cfg.proprio_stale_after_sec
@@ -360,9 +361,19 @@ class GatewayRuntime:
                 and 0.0 <= image_age <= cfg.image_stale_after_sec
             )
             image_status[image_id] = ready
-        images_ready = all(image_status.values()) if self.config.image_input_ids else True
-        if cfg.require_images and not images_ready:
-            missing.extend([f"image:{k}" for k, ready in image_status.items() if not ready])
+        images_ready = (
+            all(image_status.values())
+            if self.config.image_input_ids
+            else not cfg.require_images
+        )
+        if cfg.require_images and not self.config.image_input_ids:
+            missing.append("image_input_ids")
+        elif cfg.require_images and not images_ready:
+            missing.extend(
+                f"image:{image_id}"
+                for image_id, ready in image_status.items()
+                if not ready
+            )
 
         state_client_ready = self.state_ws_clients > 0
         if cfg.require_state_client and not state_client_ready:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -51,46 +52,49 @@ def _client(runtime: object) -> TestClient:
     return TestClient(app)
 
 
-def test_current_config_coerces_strings_and_ignores_unknown_readiness_keys() -> None:
-    parsed = config.GatewayConfig.from_dict(
-        {
-            "joint_order": ["j1"],
-            "readiness": {
-                "require_images": "false",
-                "require_image_clients": True,
-            },
-            "agent": {
-                "enabled": "false",
-                "write_context_snapshot": "false",
-            },
-        }
-    )
-
-    assert parsed.readiness.require_images is True
-    assert parsed.readiness.require_image_client is False
-    assert parsed.agent.enabled is True
-    assert parsed.agent.write_context_snapshot is True
-
-
-def test_current_config_accepts_non_mapping_readiness_and_invalid_identifiers() -> None:
-    defaulted = config.GatewayConfig.from_dict(
-        {"joint_order": ["j1"], "readiness": []}  # type: ignore[arg-type]
-    )
-    parsed = config.GatewayConfig.from_dict(
-        {
-            "joint_order": ["j1", "j1", ""],
-            "image_input_ids": ["image/front", "image/front", ""],
-            "port": 70_000,
-        }
-    )
-
-    assert defaulted.readiness == config.ReadinessConfig()
-    assert parsed.joint_order == ["j1", "j1", ""]
-    assert parsed.image_input_ids == ["image/front", "image/front", ""]
-    assert parsed.port == 70_000
+def test_config_rejects_string_booleans_and_unknown_readiness_keys() -> None:
+    with pytest.raises(ValueError, match="readiness.require_images"):
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1"],
+                "readiness": {"require_images": "false"},
+            }
+        )
+    with pytest.raises(ValueError, match="require_image_clients"):
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1"],
+                "readiness": {"require_image_clients": True},
+            }
+        )
+    with pytest.raises(ValueError, match="agent.enabled"):
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1"],
+                "agent": {"enabled": "false"},
+            }
+        )
 
 
-def test_current_empty_required_image_set_is_vacuously_ready() -> None:
+def test_config_rejects_non_mapping_readiness_and_invalid_identifiers() -> None:
+    with pytest.raises(ValueError, match="readiness"):
+        config.GatewayConfig.from_dict(
+            {"joint_order": ["j1"], "readiness": []}  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="joint_order"):
+        config.GatewayConfig.from_dict({"joint_order": ["j1", "j1", ""]})
+    with pytest.raises(ValueError, match="image_input_ids"):
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1"],
+                "image_input_ids": ["image/front", "image/front", ""],
+            }
+        )
+    with pytest.raises(ValueError, match="port"):
+        config.GatewayConfig.from_dict({"joint_order": ["j1"], "port": 70_000})
+
+
+def test_required_images_are_not_ready_without_configured_inputs() -> None:
     runtime = GatewayRuntime(
         config.GatewayConfig.from_dict(
             {
@@ -106,14 +110,15 @@ def test_current_empty_required_image_set_is_vacuously_ready() -> None:
     try:
         readiness = runtime.readiness()
 
-        assert readiness["ready"] is True
-        assert readiness["required_images_ready"] is True
+        assert readiness["ready"] is False
+        assert readiness["required_images_ready"] is False
         assert readiness["images"] == {}
+        assert readiness["missing"] == ["image_input_ids"]
     finally:
         runtime.close()
 
 
-def test_current_unmatched_proprioception_advances_readiness() -> None:
+def test_unmatched_proprioception_does_not_advance_readiness() -> None:
     runtime = GatewayRuntime(
         config.GatewayConfig.from_dict(
             {
@@ -125,12 +130,120 @@ def test_current_unmatched_proprioception_advances_readiness() -> None:
     try:
         message = JointState(name=["other"], position=[1.0])
 
-        handle_dora_input(runtime, "proprio_state", message.to_arrow())
+        with pytest.raises(
+            ValueError,
+            match="does not contain any configured joints",
+        ):
+            handle_dora_input(runtime, "proprio_state", message.to_arrow())
 
         with runtime.lock:
             assert runtime.proprio_state == {}
-            assert runtime.latest_proprio_time is not None
+            assert runtime.latest_proprio_time is None
+            assert runtime.nodes["proprio_state"].health == "error"
+        assert runtime.readiness()["ready"] is False
+    finally:
+        runtime.close()
+
+
+def test_proprioception_without_values_does_not_advance_readiness() -> None:
+    runtime = GatewayRuntime(
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1"],
+                "readiness": {"require_images": False},
+            }
+        )
+    )
+    try:
+        message = JointState(name=["j1"])
+
+        with pytest.raises(ValueError, match="has no position, velocity, or effort"):
+            handle_dora_input(runtime, "proprio_state", message.to_arrow())
+
+        with runtime.lock:
+            assert runtime.proprio_state == {}
+            assert runtime.latest_proprio_time is None
+            assert runtime.nodes["proprio_state"].health == "error"
+        assert runtime.readiness()["ready"] is False
+    finally:
+        runtime.close()
+
+
+def test_partial_proprioception_remains_supported() -> None:
+    runtime = GatewayRuntime(
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1", "j2"],
+                "readiness": {"require_images": False},
+            }
+        )
+    )
+    try:
+        message = JointState(name=["j2"], position=[2.0])
+
+        handle_dora_input(runtime, "proprio_state", message.to_arrow())
+
+        with runtime.lock:
+            assert runtime.proprio_state == {"j2": 2.0}
+            assert runtime.nodes["proprio_state"].health == "ready"
         assert runtime.readiness()["ready"] is True
+    finally:
+        runtime.close()
+
+
+def test_invalid_proprioception_preserves_last_valid_sample() -> None:
+    runtime = GatewayRuntime(
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1"],
+                "readiness": {"require_images": False},
+            }
+        )
+    )
+    try:
+        handle_dora_input(
+            runtime,
+            "proprio_state",
+            JointState(name=["j1"], position=[1.0]).to_arrow(),
+        )
+        with runtime.lock:
+            valid_state = runtime.proprio_state
+            valid_timestamp = runtime.latest_proprio_time
+
+        with pytest.raises(ValueError, match="does not contain any configured joints"):
+            handle_dora_input(
+                runtime,
+                "proprio_state",
+                JointState(name=["other"], position=[2.0]).to_arrow(),
+            )
+
+        with runtime.lock:
+            assert runtime.proprio_state is valid_state
+            assert runtime.latest_proprio_time == valid_timestamp
+            assert runtime.nodes["proprio_state"].health == "error"
+        assert runtime.readiness()["ready"] is True
+    finally:
+        runtime.close()
+
+
+def test_fresh_timestamp_without_proprio_values_is_not_ready() -> None:
+    runtime = GatewayRuntime(
+        config.GatewayConfig.from_dict(
+            {
+                "joint_order": ["j1"],
+                "readiness": {"require_images": False},
+            }
+        )
+    )
+    try:
+        with runtime.lock:
+            runtime.latest_proprio_time = time.time()
+
+        readiness = runtime.readiness()
+
+        assert readiness["ready"] is False
+        assert readiness["proprio_state_ready"] is False
+        assert readiness["missing"] == ["proprio_state"]
     finally:
         runtime.close()
 

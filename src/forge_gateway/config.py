@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,124 @@ __all__ = [
     "load_config",
 ]
 
+_GATEWAY_CONFIG_KEYS = frozenset(
+    {
+        "joint_order",
+        "image_input_ids",
+        "host",
+        "port",
+        "state_broadcast_hz",
+        "broadcast_hz",
+        "image_broadcast_hz",
+        "ws_send_timeout_sec",
+        "jpeg_quality",
+        "policy_id",
+        "command_queue_capacity",
+        "readiness",
+        "agent",
+    }
+)
+_READINESS_CONFIG_KEYS = frozenset(
+    {
+        "require_proprio_state",
+        "require_images",
+        "require_state_client",
+        "require_image_client",
+        "proprio_stale_after_sec",
+        "image_stale_after_sec",
+    }
+)
+_AGENT_CONFIG_KEYS = frozenset(
+    {
+        "enabled",
+        "state_dir",
+        "command_timeout_sec",
+        "max_active_sessions",
+        "write_context_snapshot",
+        "action_manifests",
+    }
+)
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _reject_unknown_keys(
+    data: Mapping[str, Any], allowed_keys: frozenset[str], context: str
+) -> None:
+    unknown_keys = [key for key in data if key not in allowed_keys]
+    if unknown_keys:
+        rendered_keys = ", ".join(sorted(repr(key) for key in unknown_keys))
+        raise ValueError(f"unknown {context} config key(s): {rendered_keys}")
+
+
+def _require_bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _require_finite_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a finite number")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{field_name} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be a finite number")
+    return number
+
+
+def _require_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer")
+    return value
+
+
+def _require_non_empty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _require_unique_non_empty_strings(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"{field_name} entries must be non-empty strings")
+        if item in seen:
+            raise ValueError(f"{field_name} entries must be unique")
+        seen.add(item)
+        result.append(item)
+    return result
+
 
 @dataclass(frozen=True)
 class ReadinessConfig:
@@ -39,22 +159,48 @@ class ReadinessConfig:
     image_stale_after_sec: float = 2.0
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "ReadinessConfig":
-        if not data:
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "ReadinessConfig":
+        if data is None:
             return cls()
+        if not isinstance(data, Mapping):
+            raise ValueError("readiness config must be a YAML mapping or null")
+        _reject_unknown_keys(data, _READINESS_CONFIG_KEYS, "readiness")
+
         proprio_stale_raw = data.get("proprio_stale_after_sec", 2.0)
         proprio_stale_after_sec = (
             None
             if proprio_stale_raw is None
-            else max(0.1, float(proprio_stale_raw))
+            else max(
+                0.1,
+                _require_finite_float(
+                    proprio_stale_raw, "readiness.proprio_stale_after_sec"
+                ),
+            )
         )
         return cls(
-            require_proprio_state=bool(data.get("require_proprio_state", True)),
-            require_images=bool(data.get("require_images", True)),
-            require_state_client=bool(data.get("require_state_client", False)),
-            require_image_client=bool(data.get("require_image_client", False)),
+            require_proprio_state=_require_bool(
+                data.get("require_proprio_state", True),
+                "readiness.require_proprio_state",
+            ),
+            require_images=_require_bool(
+                data.get("require_images", True), "readiness.require_images"
+            ),
+            require_state_client=_require_bool(
+                data.get("require_state_client", False),
+                "readiness.require_state_client",
+            ),
+            require_image_client=_require_bool(
+                data.get("require_image_client", False),
+                "readiness.require_image_client",
+            ),
             proprio_stale_after_sec=proprio_stale_after_sec,
-            image_stale_after_sec=max(0.1, float(data.get("image_stale_after_sec", 2.0))),
+            image_stale_after_sec=max(
+                0.1,
+                _require_finite_float(
+                    data.get("image_stale_after_sec", 2.0),
+                    "readiness.image_stale_after_sec",
+                ),
+            ),
         )
 
 
@@ -71,27 +217,66 @@ class AgentConfig:
     actions: dict[str, AgentActionConfig] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None, *, base_dir: Path | None = None) -> "AgentConfig":
+    def from_dict(
+        cls,
+        data: Mapping[str, Any] | None,
+        *,
+        base_dir: Path | None = None,
+    ) -> "AgentConfig":
         if data is None:
             manifests = _default_action_manifests()
-            return cls(action_manifests=[str(path) for path in manifests], actions=_load_action_manifests(manifests))
-        if not isinstance(data, dict):
-            raise ValueError("agent config must be a YAML mapping")
+            return cls(
+                action_manifests=[str(path) for path in manifests],
+                actions=_load_action_manifests(manifests),
+            )
+        if not isinstance(data, Mapping):
+            raise ValueError("agent config must be a YAML mapping or null")
+        _reject_unknown_keys(data, _AGENT_CONFIG_KEYS, "agent")
+
+        enabled = _require_bool(data.get("enabled", True), "agent.enabled")
+        command_timeout_sec = max(
+            1.0,
+            _require_finite_float(
+                data.get("command_timeout_sec", 120.0),
+                "agent.command_timeout_sec",
+            ),
+        )
+        write_context_snapshot = _require_bool(
+            data.get("write_context_snapshot", True),
+            "agent.write_context_snapshot",
+        )
+        state_dir_raw = data.get("state_dir")
+        state_dir = (
+            None
+            if state_dir_raw is None
+            else _require_non_empty_string(state_dir_raw, "agent.state_dir")
+        )
+        max_active_sessions = data.get("max_active_sessions", 1)
+        if (
+            isinstance(max_active_sessions, bool)
+            or not isinstance(max_active_sessions, int)
+            or max_active_sessions != 1
+        ):
+            raise ValueError("agent.max_active_sessions must be the integer 1")
+
         manifest_values = data.get("action_manifests")
         if manifest_values is None:
             manifests = _default_action_manifests()
         else:
-            if not isinstance(manifest_values, list) or not all(isinstance(x, str) for x in manifest_values):
-                raise ValueError("agent.action_manifests must be a list of strings")
-            manifests = [_resolve_path(Path(value), base_dir) for value in manifest_values]
+            manifest_strings = _require_unique_non_empty_strings(
+                manifest_values, "agent.action_manifests"
+            )
+            manifests = [
+                _resolve_path(Path(value), base_dir) for value in manifest_strings
+            ]
         actions = _load_action_manifests(manifests)
-        state_dir = data.get("state_dir")
+
         return cls(
-            enabled=bool(data.get("enabled", True)),
-            state_dir=str(state_dir) if state_dir else None,
-            command_timeout_sec=max(1.0, float(data.get("command_timeout_sec", 120.0))),
-            max_active_sessions=1,
-            write_context_snapshot=bool(data.get("write_context_snapshot", True)),
+            enabled=enabled,
+            state_dir=state_dir,
+            command_timeout_sec=command_timeout_sec,
+            max_active_sessions=max_active_sessions,
+            write_context_snapshot=write_context_snapshot,
             action_manifests=[str(path) for path in manifests],
             actions=actions,
         )
@@ -115,29 +300,69 @@ class GatewayConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, base_dir: Path | None = None) -> "GatewayConfig":
-        joint_order = data.get("joint_order", [])
-        image_input_ids = data.get("image_input_ids", [])
-        if not isinstance(joint_order, list) or not all(isinstance(x, str) for x in joint_order):
-            raise ValueError("joint_order must be a list of strings")
-        if not isinstance(image_input_ids, list) or not all(isinstance(x, str) for x in image_input_ids):
-            raise ValueError("image_input_ids must be a list of strings")
+    def from_dict(
+        cls, data: Mapping[str, Any], *, base_dir: Path | None = None
+    ) -> "GatewayConfig":
+        if not isinstance(data, Mapping):
+            raise ValueError("gateway config must be a YAML mapping")
+        _reject_unknown_keys(data, _GATEWAY_CONFIG_KEYS, "gateway")
+        if "state_broadcast_hz" in data and "broadcast_hz" in data:
+            raise ValueError(
+                "state_broadcast_hz and legacy broadcast_hz cannot both be set"
+            )
 
-        jpeg_quality = int(data.get("jpeg_quality", 85))
-        if jpeg_quality < 1 or jpeg_quality > 100:
+        joint_order = _require_unique_non_empty_strings(
+            data.get("joint_order", []), "joint_order"
+        )
+        image_input_ids = _require_unique_non_empty_strings(
+            data.get("image_input_ids", []), "image_input_ids"
+        )
+        host = _require_non_empty_string(data.get("host", "127.0.0.1"), "host")
+        policy_id = _require_non_empty_string(
+            data.get("policy_id", "default"), "policy_id"
+        )
+
+        port = _require_int(data.get("port", 9001), "port")
+        if not 1 <= port <= 65535:
+            raise ValueError("port must be in [1, 65535]")
+
+        jpeg_quality = _require_int(data.get("jpeg_quality", 85), "jpeg_quality")
+        if not 1 <= jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be in [1, 100]")
 
+        command_queue_capacity = _require_int(
+            data.get("command_queue_capacity", 256), "command_queue_capacity"
+        )
+        if command_queue_capacity < 1:
+            raise ValueError("command_queue_capacity must be at least 1")
+
+        state_broadcast_raw = (
+            data["state_broadcast_hz"]
+            if "state_broadcast_hz" in data
+            else data.get("broadcast_hz", 50.0)
+        )
         return cls(
             joint_order=joint_order,
             image_input_ids=image_input_ids,
-            host=str(data.get("host", "127.0.0.1")),
-            port=int(data.get("port", 9001)),
-            state_broadcast_hz=_clamp_hz(float(data.get("state_broadcast_hz", data.get("broadcast_hz", 50.0)))),
-            image_broadcast_hz=_clamp_hz(float(data.get("image_broadcast_hz", 24.0))),
-            ws_send_timeout_sec=max(0.1, float(data.get("ws_send_timeout_sec", 1.0))),
+            host=host,
+            port=port,
+            state_broadcast_hz=_clamp_hz(
+                _require_finite_float(state_broadcast_raw, "state_broadcast_hz")
+            ),
+            image_broadcast_hz=_clamp_hz(
+                _require_finite_float(
+                    data.get("image_broadcast_hz", 24.0), "image_broadcast_hz"
+                )
+            ),
+            ws_send_timeout_sec=max(
+                0.1,
+                _require_finite_float(
+                    data.get("ws_send_timeout_sec", 1.0), "ws_send_timeout_sec"
+                ),
+            ),
             jpeg_quality=jpeg_quality,
-            policy_id=str(data.get("policy_id", "default")),
-            command_queue_capacity=max(1, int(data.get("command_queue_capacity", 256))),
+            policy_id=policy_id,
+            command_queue_capacity=command_queue_capacity,
             readiness=ReadinessConfig.from_dict(data.get("readiness")),
             agent=AgentConfig.from_dict(data.get("agent"), base_dir=base_dir),
         )
@@ -148,7 +373,7 @@ class GatewayConfig:
         if not p.exists():
             raise FileNotFoundError(f"配置文件不存在: {p}")
         with p.open(encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=_UniqueKeySafeLoader)
         if not data:
             raise ValueError(f"配置文件为空: {p}")
         if not isinstance(data, dict):

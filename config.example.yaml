@@ -52,7 +52,7 @@ agent:
   # state_dir: /tmp/paos_forge_gateway_state
 
   command_timeout_sec: 120.0    # 预留给 Watchdog MVP+ 的命令超时配置，最小 1 秒。
-  max_active_sessions: 1        # MVP+ 强制串行动作；该值会被 Gateway 固定为 1，不用于开启并行。
+  max_active_sessions: 1        # MVP+ 强制串行动作；仅支持整数 1，其他值会导致配置错误。
   write_context_snapshot: true  # 配置 state_dir 后，是否写 runtime_context.json 快照。
 
   # PAOS Agent 高层 action manifest。

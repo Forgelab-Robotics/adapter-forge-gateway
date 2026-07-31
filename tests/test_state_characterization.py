@@ -76,6 +76,7 @@ def test_proprioception_becomes_stale_by_default() -> None:
     runtime = _runtime()
     try:
         with runtime.lock:
+            runtime.proprio_state = {"j1": 0.0}
             runtime.latest_proprio_time = 1.0
             readiness = runtime._readiness_locked(1_000_000.0)
 
@@ -90,12 +91,16 @@ def test_explicit_null_proprio_timeout_keeps_presence_only_compatibility() -> No
     cfg = config.GatewayConfig.from_dict(
         {
             "joint_order": ["j1"],
-            "readiness": {"proprio_stale_after_sec": None},
+            "readiness": {
+                "require_images": False,
+                "proprio_stale_after_sec": None,
+            },
         }
     )
     runtime = GatewayRuntime(cfg)
     try:
         with runtime.lock:
+            runtime.proprio_state = {"j1": 0.0}
             runtime.latest_proprio_time = 1.0
             readiness = runtime._readiness_locked(1_000_000.0)
 
