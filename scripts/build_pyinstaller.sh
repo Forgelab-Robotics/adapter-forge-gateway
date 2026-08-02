@@ -42,4 +42,12 @@ fi
 echo "==> [gateway] 验证可执行文件帮助信息..."
 "${DIST_FILE}" --help
 
+echo "==> [gateway] 验证可执行文件版本..."
+VERSION_OUTPUT="$("${DIST_FILE}" --version)"
+if [[ "${VERSION_OUTPUT}" != "forge-gateway 1.0.0" ]]; then
+  echo "ERROR: 非预期版本输出：${VERSION_OUTPUT}" >&2
+  exit 1
+fi
+printf '%s\n' "${VERSION_OUTPUT}"
+
 echo "==> [gateway] 构建成功：${DIST_FILE}"

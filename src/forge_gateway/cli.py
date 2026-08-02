@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
+from forge_gateway import __version__
 from forge_gateway.application import GatewayApplication
 from forge_gateway.config import load_config
 from forge_gateway.services.runtime_service import GatewayRuntime
@@ -28,6 +29,11 @@ logger = get_logger(__name__)
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Forge unified gateway node")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"forge-gateway {__version__}",
+    )
     parser.add_argument("--config", type=str, default=None, help="YAML config path")
     parser.add_argument("--host", type=str, default=None, help="HTTP/WebSocket host override")
     parser.add_argument("--port", type=int, default=None, help="HTTP/WebSocket port override")

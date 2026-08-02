@@ -27,6 +27,7 @@ uv run pytest -q
 ```bash
 uv run python main.py --config config.example.yaml
 uv run python main.py --help
+uv run python main.py --version  # forge-gateway 1.0.0
 ```
 
 这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。
@@ -37,7 +38,7 @@ uv run python main.py --help
 ./scripts/build_pyinstaller.sh
 ```
 
-构建脚本使用临时 `.venv_build` 环境，将产物写入 `dist/gateway`，并在完成后执行 `dist/gateway --help` 验证入口。
+构建脚本使用临时 `.venv_build` 环境，将产物写入 `dist/gateway`，并在完成后执行 `dist/gateway --help` 与 `dist/gateway --version` 验证入口和版本。
 
 ## 应用生命周期
 

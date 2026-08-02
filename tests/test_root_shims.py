@@ -56,6 +56,20 @@ def test_root_main_help_prefers_checkout_src(tmp_path: Path) -> None:
     assert "Forge unified gateway node" in result.stdout
 
 
+def test_root_main_version_prefers_checkout_src(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "main.py"), "--version"],
+        cwd=tmp_path,
+        env=_subprocess_env_with_fake_package(tmp_path),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "forge-gateway 1.0.0\n"
+
+
 def test_root_config_forwards_head_symbols_and_prefers_checkout_src(tmp_path: Path) -> None:
     code = f"""
 import sys

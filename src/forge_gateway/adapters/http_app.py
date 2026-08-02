@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from forge_gateway import __version__
 from forge_gateway.controllers.agent_controller import register_agent_routes
 from forge_gateway.controllers.playback_controller import register_playback_routes
 from forge_gateway.controllers.policy_controller import register_policy_routes
@@ -23,7 +24,7 @@ STATIC_DIR = Path(__file__).resolve().parents[1] / "resources" / "static"
 
 
 def create_app(runtime: Any, stop_event: threading.Event | None = None) -> FastAPI:
-    app = FastAPI(title="Forge Gateway", version="0.1.0")
+    app = FastAPI(title="Forge Gateway", version=__version__)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

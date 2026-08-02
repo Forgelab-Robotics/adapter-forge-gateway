@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tomllib
@@ -45,6 +46,22 @@ def test_source_entrypoint_help_works_outside_project(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Forge unified gateway node" in result.stdout
+
+
+def test_source_node_version_works_outside_project(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+    result = subprocess.run(
+        [sys.executable, "-m", "forge_gateway", "--version"],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "forge-gateway 1.0.0\n"
 
 
 def test_uv_project_is_not_a_python_distribution() -> None:
