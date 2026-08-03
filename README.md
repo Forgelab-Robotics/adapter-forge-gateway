@@ -27,7 +27,7 @@ uv run pytest -q
 ```bash
 uv run python main.py --config config.example.yaml
 uv run python main.py --help
-uv run python main.py --version  # forge-gateway 1.0.0
+uv run python main.py --version  # forge-gateway 1.0.1
 ```
 
 这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。
