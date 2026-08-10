@@ -30,7 +30,7 @@ uv run python main.py --help
 uv run python main.py --version  # forge-gateway 1.0.1
 ```
 
-这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。
+这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。Tool Registry slice 要求通过 `uv sync --frozen` 使用 lock 中同一 Forge commit 的 `forge-msgs` 与 `forge-tool`；普通 `pip install .` 不属于受支持的原子部署路径。
 
 构建独立可执行文件：
 
@@ -74,6 +74,11 @@ readiness:
   require_image_client: false
   proprio_stale_after_sec: 2.0  # 设为 null 可显式使用旧的 presence-only 行为
   image_stale_after_sec: 2.0
+
+tool_registry:
+  enabled: false
+  lease_ttl_ms: 15000
+  routes: []
 ```
 
 Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形式的布尔值、非有限数值、空/重复 input ID 都会直接报错。`agent.max_active_sessions` 当前只允许整数 `1`；旧的 `broadcast_hz` alias 仍可单独使用，但不能与 `state_broadcast_hz` 同时配置。
@@ -81,6 +86,8 @@ Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形
 当 `readiness.require_images: true` 时，`image_input_ids` 不能为空，否则 readiness 会报告缺少 `image_input_ids`。本体状态必须携带 position、velocity 或 effort 数值，并至少匹配一个 `joint_order` 中的 joint；partial joint state 仍受支持。
 
 未配置 `agent.action_manifests` 时，Gateway 会加载 package 内置的 `piper/sam3.md`，无需复制资源或依赖当前工作目录。显式配置外部 manifest 时，相对路径仍按 YAML 配置文件所在目录解析。
+
+`tool_registry.enabled: true` 时，Gateway 可以作为 Registry-only Dora 节点启动，不要求 `joint_order`。每条 route 静态绑定一个 trusted Dora source、source generation、management request/response 端口和预留的 Tool request/response 端口。Registry 对每个 `endpoint_id` 只维护一个 current instance，使用 Gateway monotonic receive time 管理 lease；register/heartbeat/unregister 通过 correlated `endpoint.registry.response` 确认。当前 slice 尚未提供 HTTP Tool API，也尚未通过 Gateway 路由 Tool invoke。
 
 启动：
 
@@ -151,7 +158,13 @@ uv run python main.py --config gateway.yaml --print-capabilities
 - `record_status`
 - `playback_status`
 - 配置中的 `image_input_ids`
+- 启用 Tool Registry 时，每条 route 的 `management_input_id`
+- 预留给 Tool Router 的每条 route `tool_response_input_id`（当前尚未消费）
 
 输出：
 
 - `policy_command`
+- 启用 Tool Registry 时，每条 route 的 `management_response_output_id`
+- 预留给 Tool Router 的每条 route `tool_request_output_id`（当前尚未发送）
+
+Tool management/response 输入使用有界 FIFO，不参与图像/状态的 latest-value coalescing；FIFO 满时 Gateway 显式失败，不静默丢失 registration、response 或 error。

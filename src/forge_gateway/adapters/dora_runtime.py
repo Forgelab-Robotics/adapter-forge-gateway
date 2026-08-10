@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 import threading
+import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
@@ -18,6 +19,7 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
+
 from forge_gateway.adapters.dora_adapter import (
     DoraEventBuffer,
     drain_commands,
@@ -25,6 +27,8 @@ from forge_gateway.adapters.dora_adapter import (
 )
 
 logger = get_logger("forge_gateway.cli")
+
+_TOOL_RECEIVED_AT_KEY = "_forge_gateway_received_monotonic"
 
 DoraRunReason = Literal[
     "stop",
@@ -41,6 +45,27 @@ class DoraNodeLike(Protocol):
     def send_output(self, output_id: str, data: Any, /) -> None: ...
 
 
+def handle_tool_management_input(
+    runtime: GatewayRuntime,
+    node: DoraNodeLike,
+    input_id: str,
+    value: object,
+    *,
+    received_at: float | None = None,
+) -> object:
+    from forge_gateway.adapters.tool_dora import handle_tool_management_input as handle
+
+    return handle(runtime, node, input_id, value, received_at=received_at)
+
+
+def sweep_expired_endpoints(runtime: GatewayRuntime) -> tuple[object, ...]:
+    if not runtime.config.tool_registry.enabled:
+        return ()
+    from forge_gateway.adapters.tool_dora import sweep_expired_endpoints as sweep
+
+    return sweep(runtime)
+
+
 class GatewayDoraRunner:
     """Read Dora events in the background and process them on one lifecycle thread."""
 
@@ -51,12 +76,16 @@ class GatewayDoraRunner:
         node: DoraNodeLike,
         stop_event: threading.Event,
         poll_timeout: float = 0.2,
+        tool_input_fifo_capacity: int = 256,
     ) -> None:
         self._runtime = runtime
         self._node = node
         self._stop_event = stop_event
         self._poll_timeout = poll_timeout
-        self._events = DoraEventBuffer()
+        self._events = DoraEventBuffer(
+            fifo_input_ids=runtime.tool_input_ids,
+            fifo_capacity=tool_input_fifo_capacity,
+        )
         self._end_sentinel = object()
         self._reader_started = threading.Event()
         self._reader_error_lock = threading.Lock()
@@ -79,11 +108,13 @@ class GatewayDoraRunner:
 
     def run(self) -> DoraRunReason:
         while True:
-            if self._apply_reader_error():
-                return "reader_error"
-            if self._stop_event.is_set():
-                return "reader_error" if self._apply_reader_error() else "shutdown"
-            event = self._events.get(timeout=self._poll_timeout)
+            event = self._events.get_priority()
+            if event is None:
+                if self._apply_reader_error():
+                    return "reader_error"
+                if self._stop_event.is_set():
+                    return "shutdown"
+                event = self._events.get(timeout=self._poll_timeout)
             if event is self._end_sentinel:
                 return "eof"
             reason = self.handle_poll(cast(dict[str, Any] | None, event))
@@ -93,6 +124,7 @@ class GatewayDoraRunner:
     def handle_poll(self, event: dict[str, Any] | None) -> DoraRunReason | None:
         """Process one event-buffer poll result; ``None`` represents a timeout."""
         if event is None:
+            sweep_expired_endpoints(self._runtime)
             drain_commands(self._runtime, self._node)
             return None
 
@@ -101,29 +133,40 @@ class GatewayDoraRunner:
             return "stop"
         if event_type == "ERROR":
             with self._runtime.lock:
-                self._runtime.last_error = f"dora error: {event.get('error', 'unknown')}"
+                self._runtime.last_error = (
+                    f"dora error: {event.get('error', 'unknown')}"
+                )
             return "error"
         if event_type == "READER_ERROR":
             self._apply_reader_error()
             return "reader_error"
         if event_type == "INPUT":
+            input_id = str(event.get("id"))
             try:
-                handle_dora_input(
-                    self._runtime,
-                    str(event.get("id")),
-                    event.get("value"),
-                )
+                if input_id in self._runtime.tool_management_input_ids:
+                    handle_tool_management_input(
+                        self._runtime,
+                        self._node,
+                        input_id,
+                        event.get("value"),
+                        received_at=event.get(_TOOL_RECEIVED_AT_KEY),
+                    )
+                else:
+                    handle_dora_input(
+                        self._runtime,
+                        input_id,
+                        event.get("value"),
+                    )
             except Exception as error:
                 logger.warning(
                     "gateway: handle input %s failed: %s",
-                    event.get("id"),
+                    input_id,
                     error,
                 )
                 with self._runtime.lock:
-                    self._runtime.last_error = (
-                        f"input {event.get('id')} failed: {error}"
-                    )
+                    self._runtime.last_error = f"input {input_id} failed: {error}"
 
+        sweep_expired_endpoints(self._runtime)
         drain_commands(self._runtime, self._node)
         return None
 
@@ -144,8 +187,16 @@ class GatewayDoraRunner:
         self._reader_started.set()
         try:
             for event in self._node:
+                received_at = time.monotonic()
                 if self._stop_event.is_set():
                     break
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "INPUT"
+                    and str(event.get("id")) in self._runtime.tool_management_input_ids
+                ):
+                    event = dict(event)
+                    event[_TOOL_RECEIVED_AT_KEY] = received_at
                 self._events.put(event)
         except BaseException as error:
             with self._reader_error_lock:

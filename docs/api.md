@@ -175,10 +175,16 @@ Agent-facing reset 入口，内部复用 runtime `reset_scene` 命令。
 - `playback_status`
 - `policy_command_status`
 - 配置中的 `image_input_ids`
+- `tool_registry.routes[*].management_input_id`：Endpoint register/heartbeat/unregister
+- `tool_registry.routes[*].tool_response_input_id`：为后续 Tool Router 预留
 
 输出：
 
 - `policy_command`
+- `tool_registry.routes[*].management_response_output_id`：correlated `endpoint.registry.response`
+- `tool_registry.routes[*].tool_request_output_id`：为后续 Tool Router 预留
+
+Tool Registry 使用静态 Dora route 作为 trusted source authority，按 Gateway monotonic receive time维护 lease。Tool 控制输入走有界 FIFO，不会像图像/状态输入一样按 input ID 合并。当前版本没有公开 HTTP Tool discovery/invoke API，也尚未通过 Gateway 路由 Tool invoke。
 
 ## Action Manifest
 

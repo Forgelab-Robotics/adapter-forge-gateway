@@ -32,6 +32,22 @@ jpeg_quality: 85          # Web 端图像 JPEG 质量，范围 1-100。
 policy_id: default        # 展示/控制使用的策略标识，通常保持 default。
 command_queue_capacity: 256  # 普通出站命令上限；另保留一个 safety stop 槽位。
 
+# Forge ToolEndpoint Registry is opt-in. Every enabled route binds one trusted
+# Dora source generation to one endpoint and gives management/execution traffic
+# distinct input/output IDs.
+tool_registry:
+  enabled: false
+  lease_ttl_ms: 15000
+  routes: []
+  # routes:
+  #   - endpoint_id: vision.yolo
+  #     source_id: dora:yolo
+  #     source_generation: 1
+  #     management_input_id: yolo/endpoint_management
+  #     management_response_output_id: yolo/endpoint_management_response
+  #     tool_request_output_id: yolo/tool_request
+  #     tool_response_input_id: yolo/tool_response
+
 readiness:
   require_proprio_state: true   # true 时，收到本体状态后才允许 /runtime/start 生效。
   require_images: true          # true 时，所有 image_input_ids 都收到新图像后才允许启动。

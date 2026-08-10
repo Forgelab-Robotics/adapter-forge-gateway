@@ -94,8 +94,8 @@ def main() -> int:
                 close_succeeded = False
         return 0 if close_succeeded else 1
 
-    if not config.joint_order:
-        logger.error("gateway requires joint_order in config")
+    if not config.joint_order and not config.tool_registry.enabled:
+        logger.error("gateway requires joint_order or an enabled Tool Registry")
         return 1
 
     application = GatewayApplication(config)

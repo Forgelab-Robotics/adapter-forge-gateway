@@ -21,10 +21,15 @@ def test_public_versions_match_project_metadata() -> None:
     assert create_app(FakeRuntime()).version == __version__
 
 
-def test_forge_dependencies_use_stable_v1_tags() -> None:
+def test_forge_dependencies_use_immutable_compatible_sources() -> None:
     metadata = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = metadata["project"]["dependencies"]
+    sources = metadata["tool"]["uv"]["sources"]
 
-    assert "forge-msgs>=1.0.0,<2" in metadata["project"]["dependencies"]
-    assert "forge-common>=1.0.0,<2" in metadata["project"]["dependencies"]
-    assert metadata["tool"]["uv"]["sources"]["forge-msgs"]["tag"] == "forge-msgs-v1.0.0"
-    assert metadata["tool"]["uv"]["sources"]["forge-common"]["tag"] == "forge-common-v1.0.0"
+    assert "forge-msgs>=1.1.0,<2" in dependencies
+    assert "forge-common>=1.0.0,<2" in dependencies
+    assert "forge-tool[dora]>=0.1.0,<0.2" in dependencies
+    assert sources["forge-common"]["tag"] == "forge-common-v1.0.0"
+    expected_revision = "844a82800a6ffc18a98f8300193a4e7999c746ff"
+    assert sources["forge-msgs"]["rev"] == expected_revision
+    assert sources["forge-tool"]["rev"] == expected_revision

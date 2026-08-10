@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 try:
@@ -18,7 +19,7 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         return logging.getLogger(name)
 
 from forge_gateway.adapters.state_files import StateFileStore
-from forge_gateway.config import GatewayConfig
+from forge_gateway.config import GatewayConfig, ToolEndpointRouteConfig
 from forge_gateway.domain.commands import Command, CommandMailboxUnavailable, CommandState
 from forge_gateway.domain.node_status import NodeStatus
 from forge_gateway.domain.sessions import SessionState
@@ -49,7 +50,30 @@ class GatewayRuntime:
     """Thread-safe shared runtime state for FastAPI and Dora loops."""
 
     def __init__(self, config: GatewayConfig) -> None:
+        from forge_gateway.domain.endpoint_registry import EndpointRegistry
+
         self.config = config
+        tool_routes = config.tool_registry.routes if config.tool_registry.enabled else []
+        self.endpoint_registry = EndpointRegistry(
+            lease_ttl_ms=config.tool_registry.lease_ttl_ms
+        )
+        self.tool_routes_by_endpoint_id = MappingProxyType(
+            {route.endpoint_id: route for route in tool_routes}
+        )
+        self.tool_management_routes_by_input_id = MappingProxyType(
+            {route.management_input_id: route for route in tool_routes}
+        )
+        self.tool_response_routes_by_input_id = MappingProxyType(
+            {route.tool_response_input_id: route for route in tool_routes}
+        )
+        self.tool_management_input_ids = frozenset(
+            self.tool_management_routes_by_input_id
+        )
+        self.tool_response_input_ids = frozenset(self.tool_response_routes_by_input_id)
+        self.tool_input_ids = self.tool_management_input_ids | self.tool_response_input_ids
+        self.tool_control_input_ids = self.tool_input_ids
+
+        # Tool endpoint discovery is intentionally distinct from PAOS action dispatch.
         self.action_registry = ActionRegistry.from_actions(config.agent.actions)
         self.capability_service = CapabilityService(
             policy_id=config.policy_id,
@@ -109,6 +133,26 @@ class GatewayRuntime:
         self.event_log_path: Path | None = self.state_store.event_log_path
         self.snapshot_path: Path | None = self.state_store.snapshot_path
         self.image_encoder = ImageEncodeWorker(self)
+
+    def tool_route_for_endpoint(
+        self, endpoint_id: str
+    ) -> ToolEndpointRouteConfig | None:
+        return self.tool_routes_by_endpoint_id.get(endpoint_id)
+
+    def tool_management_route_for_input(
+        self, input_id: str
+    ) -> ToolEndpointRouteConfig | None:
+        return self.tool_management_routes_by_input_id.get(input_id)
+
+    def tool_response_route_for_input(
+        self, input_id: str
+    ) -> ToolEndpointRouteConfig | None:
+        return self.tool_response_routes_by_input_id.get(input_id)
+
+    def tool_route_for_input(self, input_id: str) -> ToolEndpointRouteConfig | None:
+        return self.tool_management_route_for_input(
+            input_id
+        ) or self.tool_response_route_for_input(input_id)
 
     @property
     def dispatch_blocked_reason(self) -> str | None:

@@ -15,7 +15,7 @@ from forge_gateway.adapters.manifest_loader import (
     default_action_manifests as _default_action_manifests,
     load_action_manifest,
     load_action_manifests,
-    read_frontmatter as _read_frontmatter,
+    read_frontmatter as _read_frontmatter,  # noqa: F401 - top-level compatibility shim
     resolve_path as _resolve_path,
 )
 from forge_gateway.domain.action_manifest import ActionDefinition as AgentActionConfig
@@ -25,6 +25,8 @@ __all__ = [
     "AgentConfig",
     "GatewayConfig",
     "ReadinessConfig",
+    "ToolEndpointRouteConfig",
+    "ToolRegistryConfig",
     "load_config",
 ]
 
@@ -43,6 +45,7 @@ _GATEWAY_CONFIG_KEYS = frozenset(
         "command_queue_capacity",
         "readiness",
         "agent",
+        "tool_registry",
     }
 )
 _READINESS_CONFIG_KEYS = frozenset(
@@ -65,6 +68,31 @@ _AGENT_CONFIG_KEYS = frozenset(
         "action_manifests",
     }
 )
+_TOOL_REGISTRY_CONFIG_KEYS = frozenset({"enabled", "lease_ttl_ms", "routes"})
+_TOOL_ENDPOINT_ROUTE_CONFIG_KEYS = frozenset(
+    {
+        "endpoint_id",
+        "source_id",
+        "source_generation",
+        "management_input_id",
+        "management_response_output_id",
+        "tool_request_output_id",
+        "tool_response_input_id",
+    }
+)
+_MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
+_RESERVED_GATEWAY_INPUT_IDS = frozenset(
+    {
+        "tick",
+        "proprio_state",
+        "action",
+        "runtime_status",
+        "record_status",
+        "playback_status",
+        "policy_command_status",
+    }
+)
+_RESERVED_GATEWAY_OUTPUT_IDS = frozenset({"policy_command"})
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -127,6 +155,12 @@ def _require_int(value: Any, field_name: str) -> int:
 
 def _require_non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _require_non_blank_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
 
@@ -283,6 +317,167 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class ToolEndpointRouteConfig:
+    """Trusted Dora routes for one logical Tool endpoint."""
+
+    endpoint_id: str
+    source_id: str
+    source_generation: int
+    management_input_id: str
+    management_response_output_id: str
+    tool_request_output_id: str
+    tool_response_input_id: str
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+        *,
+        context: str = "tool_registry route",
+    ) -> "ToolEndpointRouteConfig":
+        if not isinstance(data, Mapping):
+            raise ValueError(f"{context} must be a YAML mapping")
+        _reject_unknown_keys(data, _TOOL_ENDPOINT_ROUTE_CONFIG_KEYS, context)
+        missing_keys = [
+            key for key in _TOOL_ENDPOINT_ROUTE_CONFIG_KEYS if key not in data
+        ]
+        if missing_keys:
+            rendered_keys = ", ".join(sorted(missing_keys))
+            raise ValueError(f"missing {context} config key(s): {rendered_keys}")
+
+        source_generation = _require_int(
+            data["source_generation"], f"{context}.source_generation"
+        )
+        if not 0 <= source_generation <= _MAX_SAFE_JSON_INTEGER:
+            raise ValueError(
+                f"{context}.source_generation must be in [0, {_MAX_SAFE_JSON_INTEGER}]"
+            )
+
+        string_fields = {
+            field_name: _require_non_blank_string(
+                data[field_name], f"{context}.{field_name}"
+            )
+            for field_name in _TOOL_ENDPOINT_ROUTE_CONFIG_KEYS
+            if field_name != "source_generation"
+        }
+        return cls(
+            endpoint_id=string_fields["endpoint_id"],
+            source_id=string_fields["source_id"],
+            source_generation=source_generation,
+            management_input_id=string_fields["management_input_id"],
+            management_response_output_id=string_fields[
+                "management_response_output_id"
+            ],
+            tool_request_output_id=string_fields["tool_request_output_id"],
+            tool_response_input_id=string_fields["tool_response_input_id"],
+        )
+
+
+@dataclass(frozen=True)
+class ToolRegistryConfig:
+    """Dora-backed Tool endpoint Registry configuration."""
+
+    enabled: bool = False
+    lease_ttl_ms: int = 15_000
+    routes: list[ToolEndpointRouteConfig] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "ToolRegistryConfig":
+        if data is None:
+            return cls()
+        if not isinstance(data, Mapping):
+            raise ValueError("tool_registry config must be a YAML mapping or null")
+        _reject_unknown_keys(data, _TOOL_REGISTRY_CONFIG_KEYS, "tool_registry")
+
+        lease_ttl_ms = _require_int(
+            data.get("lease_ttl_ms", 15_000), "tool_registry.lease_ttl_ms"
+        )
+        if not 1 <= lease_ttl_ms <= _MAX_SAFE_JSON_INTEGER:
+            raise ValueError(
+                "tool_registry.lease_ttl_ms must be a positive integer not greater "
+                f"than {_MAX_SAFE_JSON_INTEGER}"
+            )
+
+        routes_raw = data.get("routes", [])
+        if not isinstance(routes_raw, list):
+            raise ValueError("tool_registry.routes must be a list")
+        routes = [
+            ToolEndpointRouteConfig.from_dict(
+                route,
+                context=f"tool_registry.routes[{index}]",
+            )
+            for index, route in enumerate(routes_raw)
+        ]
+        enabled = _require_bool(data.get("enabled", False), "tool_registry.enabled")
+        if enabled and not routes:
+            raise ValueError("tool_registry.routes must not be empty when enabled")
+        _validate_tool_route_ids(routes)
+        return cls(
+            enabled=enabled,
+            lease_ttl_ms=lease_ttl_ms,
+            routes=routes,
+        )
+
+
+def _validate_tool_route_ids(
+    routes: list[ToolEndpointRouteConfig],
+    *,
+    image_input_ids: list[str] | None = None,
+) -> None:
+    identifier_groups = {
+        "endpoint": [(route.endpoint_id, "endpoint_id") for route in routes],
+        "input": [
+            identifier
+            for route in routes
+            for identifier in (
+                (route.management_input_id, "management_input_id"),
+                (route.tool_response_input_id, "tool_response_input_id"),
+            )
+        ],
+        "output": [
+            identifier
+            for route in routes
+            for identifier in (
+                (
+                    route.management_response_output_id,
+                    "management_response_output_id",
+                ),
+                (route.tool_request_output_id, "tool_request_output_id"),
+            )
+        ],
+    }
+    reserved_inputs = _RESERVED_GATEWAY_INPUT_IDS | frozenset(image_input_ids or ())
+    for route in routes:
+        for field_name, identifier in (
+            ("management_input_id", route.management_input_id),
+            ("tool_response_input_id", route.tool_response_input_id),
+        ):
+            if identifier in reserved_inputs:
+                raise ValueError(
+                    f"Tool route {field_name} {identifier!r} conflicts with a reserved Gateway input"
+                )
+        for field_name, identifier in (
+            ("management_response_output_id", route.management_response_output_id),
+            ("tool_request_output_id", route.tool_request_output_id),
+        ):
+            if identifier in _RESERVED_GATEWAY_OUTPUT_IDS:
+                raise ValueError(
+                    f"Tool route {field_name} {identifier!r} conflicts with a reserved Gateway output"
+                )
+
+    for identifier_kind, identifiers in identifier_groups.items():
+        seen: dict[str, str] = {}
+        for identifier, field_name in identifiers:
+            previous_field = seen.get(identifier)
+            if previous_field is not None:
+                raise ValueError(
+                    f"duplicate Tool route {identifier_kind} ID {identifier!r} "
+                    f"in {previous_field} and {field_name}"
+                )
+            seen[identifier] = field_name
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     """Unified HTTP/WebSocket gateway configuration."""
 
@@ -298,6 +493,7 @@ class GatewayConfig:
     command_queue_capacity: int = 256
     readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    tool_registry: ToolRegistryConfig = field(default_factory=ToolRegistryConfig)
 
     @classmethod
     def from_dict(
@@ -341,6 +537,11 @@ class GatewayConfig:
             if "state_broadcast_hz" in data
             else data.get("broadcast_hz", 50.0)
         )
+        tool_registry = ToolRegistryConfig.from_dict(data.get("tool_registry"))
+        _validate_tool_route_ids(
+            tool_registry.routes,
+            image_input_ids=image_input_ids,
+        )
         return cls(
             joint_order=joint_order,
             image_input_ids=image_input_ids,
@@ -365,6 +566,7 @@ class GatewayConfig:
             command_queue_capacity=command_queue_capacity,
             readiness=ReadinessConfig.from_dict(data.get("readiness")),
             agent=AgentConfig.from_dict(data.get("agent"), base_dir=base_dir),
+            tool_registry=tool_registry,
         )
 
     @classmethod
