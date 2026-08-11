@@ -25,8 +25,8 @@ __all__ = [
     "AgentConfig",
     "GatewayConfig",
     "ReadinessConfig",
-    "ToolEndpointRouteConfig",
-    "ToolRegistryConfig",
+    "ToolGatewayConfig",
+    "ToolProviderRouteConfig",
     "load_config",
 ]
 
@@ -45,7 +45,7 @@ _GATEWAY_CONFIG_KEYS = frozenset(
         "command_queue_capacity",
         "readiness",
         "agent",
-        "tool_registry",
+        "tools",
     }
 )
 _READINESS_CONFIG_KEYS = frozenset(
@@ -68,17 +68,18 @@ _AGENT_CONFIG_KEYS = frozenset(
         "action_manifests",
     }
 )
-_TOOL_REGISTRY_CONFIG_KEYS = frozenset({"enabled", "lease_ttl_ms", "routes"})
-_TOOL_ENDPOINT_ROUTE_CONFIG_KEYS = frozenset(
+_TOOL_GATEWAY_CONFIG_KEYS = frozenset(
     {
-        "endpoint_id",
-        "source_id",
-        "source_generation",
-        "management_input_id",
-        "management_response_output_id",
-        "tool_request_output_id",
-        "tool_response_input_id",
+        "enabled",
+        "lease_ttl_ms",
+        "invoke_timeout_ms",
+        "request_input_id",
+        "response_output_id",
+        "providers",
     }
+)
+_TOOL_PROVIDER_ROUTE_CONFIG_KEYS = frozenset(
+    {"endpoint_id", "input_id", "output_id"}
 )
 _MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 _RESERVED_GATEWAY_INPUT_IDS = frozenset(
@@ -317,161 +318,146 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
-class ToolEndpointRouteConfig:
-    """Trusted Dora routes for one logical Tool endpoint."""
+class ToolProviderRouteConfig:
+    """One configured provider's shared bidirectional Dora route."""
 
     endpoint_id: str
-    source_id: str
-    source_generation: int
-    management_input_id: str
-    management_response_output_id: str
-    tool_request_output_id: str
-    tool_response_input_id: str
+    input_id: str
+    output_id: str
 
     @classmethod
     def from_dict(
         cls,
         data: Mapping[str, Any],
         *,
-        context: str = "tool_registry route",
-    ) -> "ToolEndpointRouteConfig":
+        context: str = "tools provider",
+    ) -> "ToolProviderRouteConfig":
         if not isinstance(data, Mapping):
             raise ValueError(f"{context} must be a YAML mapping")
-        _reject_unknown_keys(data, _TOOL_ENDPOINT_ROUTE_CONFIG_KEYS, context)
+        _reject_unknown_keys(data, _TOOL_PROVIDER_ROUTE_CONFIG_KEYS, context)
         missing_keys = [
-            key for key in _TOOL_ENDPOINT_ROUTE_CONFIG_KEYS if key not in data
+            key for key in _TOOL_PROVIDER_ROUTE_CONFIG_KEYS if key not in data
         ]
         if missing_keys:
             rendered_keys = ", ".join(sorted(missing_keys))
             raise ValueError(f"missing {context} config key(s): {rendered_keys}")
-
-        source_generation = _require_int(
-            data["source_generation"], f"{context}.source_generation"
-        )
-        if not 0 <= source_generation <= _MAX_SAFE_JSON_INTEGER:
-            raise ValueError(
-                f"{context}.source_generation must be in [0, {_MAX_SAFE_JSON_INTEGER}]"
-            )
-
         string_fields = {
             field_name: _require_non_blank_string(
                 data[field_name], f"{context}.{field_name}"
             )
-            for field_name in _TOOL_ENDPOINT_ROUTE_CONFIG_KEYS
-            if field_name != "source_generation"
+            for field_name in _TOOL_PROVIDER_ROUTE_CONFIG_KEYS
         }
-        return cls(
-            endpoint_id=string_fields["endpoint_id"],
-            source_id=string_fields["source_id"],
-            source_generation=source_generation,
-            management_input_id=string_fields["management_input_id"],
-            management_response_output_id=string_fields[
-                "management_response_output_id"
-            ],
-            tool_request_output_id=string_fields["tool_request_output_id"],
-            tool_response_input_id=string_fields["tool_response_input_id"],
-        )
+        return cls(**string_fields)
 
 
 @dataclass(frozen=True)
-class ToolRegistryConfig:
-    """Dora-backed Tool endpoint Registry configuration."""
+class ToolGatewayConfig:
+    """Gateway-owned Tool discovery and Query invocation configuration."""
 
     enabled: bool = False
     lease_ttl_ms: int = 15_000
-    routes: list[ToolEndpointRouteConfig] = field(default_factory=list)
+    invoke_timeout_ms: int = 5_000
+    request_input_id: str = "tool_request"
+    response_output_id: str = "tool_response"
+    providers: list[ToolProviderRouteConfig] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any] | None) -> "ToolRegistryConfig":
+    def from_dict(cls, data: Mapping[str, Any] | None) -> "ToolGatewayConfig":
         if data is None:
             return cls()
         if not isinstance(data, Mapping):
-            raise ValueError("tool_registry config must be a YAML mapping or null")
-        _reject_unknown_keys(data, _TOOL_REGISTRY_CONFIG_KEYS, "tool_registry")
+            raise ValueError("tools config must be a YAML mapping or null")
+        _reject_unknown_keys(data, _TOOL_GATEWAY_CONFIG_KEYS, "tools")
 
-        lease_ttl_ms = _require_int(
-            data.get("lease_ttl_ms", 15_000), "tool_registry.lease_ttl_ms"
+        lease_ttl_ms = _positive_safe_integer(
+            data.get("lease_ttl_ms", 15_000), "tools.lease_ttl_ms"
         )
-        if not 1 <= lease_ttl_ms <= _MAX_SAFE_JSON_INTEGER:
-            raise ValueError(
-                "tool_registry.lease_ttl_ms must be a positive integer not greater "
-                f"than {_MAX_SAFE_JSON_INTEGER}"
+        invoke_timeout_ms = _positive_safe_integer(
+            data.get("invoke_timeout_ms", 5_000), "tools.invoke_timeout_ms"
+        )
+        request_input_id = _require_non_blank_string(
+            data.get("request_input_id", "tool_request"),
+            "tools.request_input_id",
+        )
+        response_output_id = _require_non_blank_string(
+            data.get("response_output_id", "tool_response"),
+            "tools.response_output_id",
+        )
+        providers_raw = data.get("providers", [])
+        if not isinstance(providers_raw, list):
+            raise ValueError("tools.providers must be a list")
+        providers = [
+            ToolProviderRouteConfig.from_dict(
+                provider,
+                context=f"tools.providers[{index}]",
             )
-
-        routes_raw = data.get("routes", [])
-        if not isinstance(routes_raw, list):
-            raise ValueError("tool_registry.routes must be a list")
-        routes = [
-            ToolEndpointRouteConfig.from_dict(
-                route,
-                context=f"tool_registry.routes[{index}]",
-            )
-            for index, route in enumerate(routes_raw)
+            for index, provider in enumerate(providers_raw)
         ]
-        enabled = _require_bool(data.get("enabled", False), "tool_registry.enabled")
-        if enabled and not routes:
-            raise ValueError("tool_registry.routes must not be empty when enabled")
-        _validate_tool_route_ids(routes)
-        return cls(
+        enabled = _require_bool(data.get("enabled", False), "tools.enabled")
+        if enabled and not providers:
+            raise ValueError("tools.providers must not be empty when enabled")
+        config = cls(
             enabled=enabled,
             lease_ttl_ms=lease_ttl_ms,
-            routes=routes,
+            invoke_timeout_ms=invoke_timeout_ms,
+            request_input_id=request_input_id,
+            response_output_id=response_output_id,
+            providers=providers,
         )
+        _validate_tool_port_ids(config)
+        return config
 
 
-def _validate_tool_route_ids(
-    routes: list[ToolEndpointRouteConfig],
+def _positive_safe_integer(value: Any, field_name: str) -> int:
+    result = _require_int(value, field_name)
+    if not 1 <= result <= _MAX_SAFE_JSON_INTEGER:
+        raise ValueError(
+            f"{field_name} must be a positive integer not greater than "
+            f"{_MAX_SAFE_JSON_INTEGER}"
+        )
+    return result
+
+
+def _validate_tool_port_ids(
+    tools: ToolGatewayConfig,
     *,
     image_input_ids: list[str] | None = None,
 ) -> None:
-    identifier_groups = {
-        "endpoint": [(route.endpoint_id, "endpoint_id") for route in routes],
-        "input": [
-            identifier
-            for route in routes
-            for identifier in (
-                (route.management_input_id, "management_input_id"),
-                (route.tool_response_input_id, "tool_response_input_id"),
-            )
-        ],
-        "output": [
-            identifier
-            for route in routes
-            for identifier in (
-                (
-                    route.management_response_output_id,
-                    "management_response_output_id",
-                ),
-                (route.tool_request_output_id, "tool_request_output_id"),
-            )
-        ],
-    }
-    reserved_inputs = _RESERVED_GATEWAY_INPUT_IDS | frozenset(image_input_ids or ())
-    for route in routes:
-        for field_name, identifier in (
-            ("management_input_id", route.management_input_id),
-            ("tool_response_input_id", route.tool_response_input_id),
-        ):
-            if identifier in reserved_inputs:
-                raise ValueError(
-                    f"Tool route {field_name} {identifier!r} conflicts with a reserved Gateway input"
-                )
-        for field_name, identifier in (
-            ("management_response_output_id", route.management_response_output_id),
-            ("tool_request_output_id", route.tool_request_output_id),
-        ):
-            if identifier in _RESERVED_GATEWAY_OUTPUT_IDS:
-                raise ValueError(
-                    f"Tool route {field_name} {identifier!r} conflicts with a reserved Gateway output"
-                )
+    if not tools.enabled:
+        return
+    input_ids = [(tools.request_input_id, "request_input_id")]
+    output_ids = [(tools.response_output_id, "response_output_id")]
+    endpoint_ids: list[tuple[str, str]] = []
+    for index, provider in enumerate(tools.providers):
+        endpoint_ids.append((provider.endpoint_id, f"providers[{index}].endpoint_id"))
+        input_ids.append((provider.input_id, f"providers[{index}].input_id"))
+        output_ids.append((provider.output_id, f"providers[{index}].output_id"))
 
-    for identifier_kind, identifiers in identifier_groups.items():
+    reserved_inputs = _RESERVED_GATEWAY_INPUT_IDS | frozenset(image_input_ids or ())
+    for identifier, field_name in input_ids:
+        if identifier in reserved_inputs:
+            raise ValueError(
+                f"Tool {field_name} {identifier!r} conflicts with a reserved "
+                "Gateway input"
+            )
+    for identifier, field_name in output_ids:
+        if identifier in _RESERVED_GATEWAY_OUTPUT_IDS:
+            raise ValueError(
+                f"Tool {field_name} {identifier!r} conflicts with a reserved "
+                "Gateway output"
+            )
+
+    for identifier_kind, identifiers in (
+        ("endpoint", endpoint_ids),
+        ("input", input_ids),
+        ("output", output_ids),
+    ):
         seen: dict[str, str] = {}
         for identifier, field_name in identifiers:
             previous_field = seen.get(identifier)
             if previous_field is not None:
                 raise ValueError(
-                    f"duplicate Tool route {identifier_kind} ID {identifier!r} "
+                    f"duplicate Tool {identifier_kind} ID {identifier!r} "
                     f"in {previous_field} and {field_name}"
                 )
             seen[identifier] = field_name
@@ -493,7 +479,7 @@ class GatewayConfig:
     command_queue_capacity: int = 256
     readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
-    tool_registry: ToolRegistryConfig = field(default_factory=ToolRegistryConfig)
+    tools: ToolGatewayConfig = field(default_factory=ToolGatewayConfig)
 
     @classmethod
     def from_dict(
@@ -537,11 +523,8 @@ class GatewayConfig:
             if "state_broadcast_hz" in data
             else data.get("broadcast_hz", 50.0)
         )
-        tool_registry = ToolRegistryConfig.from_dict(data.get("tool_registry"))
-        _validate_tool_route_ids(
-            tool_registry.routes,
-            image_input_ids=image_input_ids,
-        )
+        tools = ToolGatewayConfig.from_dict(data.get("tools"))
+        _validate_tool_port_ids(tools, image_input_ids=image_input_ids)
         return cls(
             joint_order=joint_order,
             image_input_ids=image_input_ids,
@@ -566,7 +549,7 @@ class GatewayConfig:
             command_queue_capacity=command_queue_capacity,
             readiness=ReadinessConfig.from_dict(data.get("readiness")),
             agent=AgentConfig.from_dict(data.get("agent"), base_dir=base_dir),
-            tool_registry=tool_registry,
+            tools=tools,
         )
 
     @classmethod

@@ -34,9 +34,9 @@ testpaths = ["tests"]
 package = false
 
 [tool.uv.sources]
-forge-msgs = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git", rev = "844a82800a6ffc18a98f8300193a4e7999c746ff", subdirectory = "packages/msgs" }
+forge-msgs = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git", rev = "446d12d12f7760540369919582f78efb6c6f5ce7", subdirectory = "packages/msgs" }
 forge-common = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git", tag = "forge-common-v1.0.0", subdirectory = "packages/common" }
-forge-tool = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git", rev = "844a82800a6ffc18a98f8300193a4e7999c746ff", subdirectory = "packages/tool" }
+forge-tool = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git", rev = "446d12d12f7760540369919582f78efb6c6f5ce7", subdirectory = "packages/tool" }
 
 [tool.pyright]
 venvPath = "."

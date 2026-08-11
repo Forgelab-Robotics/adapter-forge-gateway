@@ -16,8 +16,8 @@ AgentActionConfig = _implementation.AgentActionConfig
 AgentConfig = _implementation.AgentConfig
 GatewayConfig = _implementation.GatewayConfig
 ReadinessConfig = _implementation.ReadinessConfig
-ToolEndpointRouteConfig = _implementation.ToolEndpointRouteConfig
-ToolRegistryConfig = _implementation.ToolRegistryConfig
+ToolGatewayConfig = _implementation.ToolGatewayConfig
+ToolProviderRouteConfig = _implementation.ToolProviderRouteConfig
 os = _implementation.os
 dataclass = _implementation.dataclass
 field = _implementation.field
@@ -37,8 +37,8 @@ __all__ = [
     "AgentConfig",
     "GatewayConfig",
     "ReadinessConfig",
-    "ToolEndpointRouteConfig",
-    "ToolRegistryConfig",
+    "ToolGatewayConfig",
+    "ToolProviderRouteConfig",
     "load_action_manifest",
     "load_action_manifests",
     "load_config",

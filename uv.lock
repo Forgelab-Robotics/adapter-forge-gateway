@@ -154,8 +154,8 @@ requires-dist = [
     { name = "dora-rs", specifier = "==0.4.1" },
     { name = "fastapi" },
     { name = "forge-common", git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git?subdirectory=packages%2Fcommon&tag=forge-common-v1.0.0" },
-    { name = "forge-msgs", git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Fmsgs&rev=844a82800a6ffc18a98f8300193a4e7999c746ff" },
-    { name = "forge-tool", extras = ["dora"], git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Ftool&rev=844a82800a6ffc18a98f8300193a4e7999c746ff" },
+    { name = "forge-msgs", git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Fmsgs&rev=446d12d12f7760540369919582f78efb6c6f5ce7" },
+    { name = "forge-tool", extras = ["dora"], git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Ftool&rev=446d12d12f7760540369919582f78efb6c6f5ce7" },
     { name = "opencv-python" },
     { name = "pyyaml" },
     { name = "uvicorn", extras = ["standard"] },
@@ -171,7 +171,7 @@ dev = [
 [[package]]
 name = "forge-msgs"
 version = "1.1.0"
-source = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Fmsgs&rev=844a82800a6ffc18a98f8300193a4e7999c746ff#844a82800a6ffc18a98f8300193a4e7999c746ff" }
+source = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Fmsgs&rev=446d12d12f7760540369919582f78efb6c6f5ce7#446d12d12f7760540369919582f78efb6c6f5ce7" }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },
@@ -182,7 +182,7 @@ dependencies = [
 [[package]]
 name = "forge-tool"
 version = "0.1.0"
-source = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Ftool&rev=844a82800a6ffc18a98f8300193a4e7999c746ff#844a82800a6ffc18a98f8300193a4e7999c746ff" }
+source = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git?subdirectory=packages%2Ftool&rev=446d12d12f7760540369919582f78efb6c6f5ce7#446d12d12f7760540369919582f78efb6c6f5ce7" }
 
 [package.optional-dependencies]
 dora = [

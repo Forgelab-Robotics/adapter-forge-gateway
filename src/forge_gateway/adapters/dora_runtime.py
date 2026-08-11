@@ -45,25 +45,39 @@ class DoraNodeLike(Protocol):
     def send_output(self, output_id: str, data: Any, /) -> None: ...
 
 
-def handle_tool_management_input(
+def handle_tool_input(
     runtime: GatewayRuntime,
-    node: DoraNodeLike,
     input_id: str,
     value: object,
     *,
     received_at: float | None = None,
 ) -> object:
-    from forge_gateway.adapters.tool_dora import handle_tool_management_input as handle
+    from forge_gateway.adapters.tool_dora import handle_tool_input as handle
 
-    return handle(runtime, node, input_id, value, received_at=received_at)
+    return handle(runtime, input_id, value, received_at=received_at)
 
 
-def sweep_expired_endpoints(runtime: GatewayRuntime) -> tuple[object, ...]:
-    if not runtime.config.tool_registry.enabled:
-        return ()
-    from forge_gateway.adapters.tool_dora import sweep_expired_endpoints as sweep
+def sweep_tool_gateway(runtime: GatewayRuntime) -> object | None:
+    if not runtime.config.tools.enabled:
+        return None
+    from forge_gateway.adapters.tool_dora import sweep_tool_gateway as sweep
 
     return sweep(runtime)
+
+
+def drain_tool_outputs(
+    runtime: GatewayRuntime,
+    node: DoraNodeLike,
+    *,
+    max_messages: int | None = None,
+) -> tuple[object, ...]:
+    if not runtime.config.tools.enabled:
+        return ()
+    from forge_gateway.adapters.tool_dora import drain_tool_outputs as drain
+
+    if max_messages is None:
+        return drain(runtime, node)
+    return drain(runtime, node, max_messages=max_messages)
 
 
 class GatewayDoraRunner:
@@ -111,21 +125,20 @@ class GatewayDoraRunner:
             event = self._events.get_priority()
             if event is None:
                 if self._apply_reader_error():
-                    return "reader_error"
+                    return self._finish_run("reader_error")
                 if self._stop_event.is_set():
-                    return "shutdown"
+                    return self._finish_run("shutdown")
                 event = self._events.get(timeout=self._poll_timeout)
             if event is self._end_sentinel:
-                return "eof"
+                return self._finish_run("eof")
             reason = self.handle_poll(cast(dict[str, Any] | None, event))
             if reason is not None:
-                return reason
+                return self._finish_run(reason)
 
     def handle_poll(self, event: dict[str, Any] | None) -> DoraRunReason | None:
         """Process one event-buffer poll result; ``None`` represents a timeout."""
         if event is None:
-            sweep_expired_endpoints(self._runtime)
-            drain_commands(self._runtime, self._node)
+            self._maintain_outputs()
             return None
 
         event_type = event.get("type")
@@ -143,10 +156,9 @@ class GatewayDoraRunner:
         if event_type == "INPUT":
             input_id = str(event.get("id"))
             try:
-                if input_id in self._runtime.tool_management_input_ids:
-                    handle_tool_management_input(
+                if input_id in self._runtime.tool_input_ids:
+                    handle_tool_input(
                         self._runtime,
-                        self._node,
                         input_id,
                         event.get("value"),
                         received_at=event.get(_TOOL_RECEIVED_AT_KEY),
@@ -166,9 +178,34 @@ class GatewayDoraRunner:
                 with self._runtime.lock:
                     self._runtime.last_error = f"input {input_id} failed: {error}"
 
-        sweep_expired_endpoints(self._runtime)
-        drain_commands(self._runtime, self._node)
+        self._maintain_outputs()
         return None
+
+    def _maintain_outputs(self) -> None:
+        sweep_tool_gateway(self._runtime)
+        try:
+            drain_tool_outputs(self._runtime, self._node)
+        except Exception as error:
+            logger.warning("gateway: Tool output dispatch failed: %s", error)
+            with self._runtime.lock:
+                self._runtime.last_error = f"Tool output dispatch failed: {error}"
+        drain_commands(self._runtime, self._node)
+
+    def _finish_run(self, reason: DoraRunReason) -> DoraRunReason:
+        if not self._runtime.config.tools.enabled:
+            return reason
+        try:
+            self._runtime.tool_gateway.begin_close()
+            drain_tool_outputs(
+                self._runtime,
+                self._node,
+                max_messages=self._runtime.tool_gateway.outbound_capacity,
+            )
+        except Exception as error:
+            logger.warning("gateway: final Tool output drain failed: %s", error)
+            with self._runtime.lock:
+                self._runtime.last_error = f"final Tool output drain failed: {error}"
+        return reason
 
     def join_reader(self, timeout: float) -> bool:
         if self._reader_thread.is_alive():
@@ -193,7 +230,7 @@ class GatewayDoraRunner:
                 if (
                     isinstance(event, dict)
                     and event.get("type") == "INPUT"
-                    and str(event.get("id")) in self._runtime.tool_management_input_ids
+                    and str(event.get("id")) in self._runtime.tool_input_ids
                 ):
                     event = dict(event)
                     event[_TOOL_RECEIVED_AT_KEY] = received_at
