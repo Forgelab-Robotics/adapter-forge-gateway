@@ -11,11 +11,7 @@ from fastapi.responses import JSONResponse
 from forge_tool import ToolError
 
 from forge_gateway.controllers.utils import json_response, read_json
-from forge_gateway.services.tool_gateway_service import (
-    ToolGatewayMailboxFull,
-    ToolGatewayUnavailable,
-    tool_error_from_response,
-)
+from forge_gateway.services.tool_gateway_service import tool_error_from_response
 
 _INVOKE_BODY_KEYS = frozenset(("arguments", "caller_id", "timeout_ms"))
 
@@ -110,8 +106,6 @@ def register_tool_routes(app: FastAPI, runtime: Any) -> None:
                 caller_id=caller_id,
                 timeout_ms=timeout_ms,
             )
-        except (ToolGatewayMailboxFull, ToolGatewayUnavailable) as error:
-            return json_response(503, {"ok": False, "msg": str(error)})
         except ValueError as error:
             return json_response(400, {"ok": False, "msg": str(error)})
 

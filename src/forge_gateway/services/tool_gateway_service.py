@@ -211,7 +211,7 @@ class ToolGatewayService:
         ):
             raise ValueError("outbound_capacity must be a positive integer")
         self.config = config
-        self.directory = EndpointDirectory(lease_ttl_ms=config.lease_ttl_ms)
+        self._directory = EndpointDirectory(lease_ttl_ms=config.lease_ttl_ms)
         routes = (
             tuple(self._route_identity(provider) for provider in config.providers)
             if config.enabled
@@ -267,6 +267,44 @@ class ToolGatewayService:
         return self._outbound_capacity
 
     @property
+    def lease_ttl_ms(self) -> int:
+        return self._directory.lease_ttl_ms
+
+    @property
+    def registry_revision(self) -> int:
+        return self._directory.revision
+
+    def endpoint_registrations(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[RegisteredEndpoint, ...]:
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        with self._lock:
+            expired = self._directory.expire(observation)
+            _ = self._finish_unclaimed_for_removed_locked(
+                expired,
+                observed_at=observation,
+            )
+            return self._directory.registrations(now=observation)
+
+    def resolve_registered_endpoint(
+        self,
+        endpoint_id: str,
+        operation: str,
+        *,
+        now: float | None = None,
+    ) -> RegisteredEndpoint | None:
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        with self._lock:
+            expired = self._directory.expire(observation)
+            _ = self._finish_unclaimed_for_removed_locked(
+                expired,
+                observed_at=observation,
+            )
+            return self._directory.resolve(endpoint_id, operation, now=observation)
+
+    @property
     def outbound_count(self) -> int:
         with self._lock:
             return len(self._outbound)
@@ -318,20 +356,15 @@ class ToolGatewayService:
             raise ValueError(f"timeout_ms must be in [1, {_MAX_SAFE_JSON_INTEGER}]")
         return timeout_ms
 
-    def provider_route_for_input(
-        self, input_id: str
-    ) -> ToolProviderRouteIdentity | None:
-        return self._routes_by_input_id.get(input_id)
-
-    def provider_route_for_endpoint(
-        self, endpoint_id: str
-    ) -> ToolProviderRouteIdentity | None:
-        return self._routes_by_endpoint_id.get(endpoint_id)
-
     def discovery_snapshot(self, *, now: float | None = None) -> dict[str, object]:
         observation = time.monotonic() if now is None else self._validate_now(now)
         with self._lock:
-            snapshot = self.directory.snapshot(now=observation)
+            expired = self._directory.expire(observation)
+            _ = self._finish_unclaimed_for_removed_locked(
+                expired,
+                observed_at=observation,
+            )
+            snapshot = self._directory.snapshot(now=observation)
             return {
                 "revision": snapshot.revision,
                 "tools": [
@@ -407,13 +440,13 @@ class ToolGatewayService:
             reserved = True
             try:
                 if envelope.message_type == "endpoint.register":
-                    decision = self.directory.register(
+                    mutation = self._directory.register_with_change(
                         envelope,
                         route,
                         now=received_at,
                     )
                 else:
-                    decision = self.directory.unregister(
+                    mutation = self._directory.unregister_with_change(
                         envelope,
                         route,
                         now=received_at,
@@ -422,13 +455,17 @@ class ToolGatewayService:
                     ToolOutboundMessage(
                         output_id=route.output_id,
                         envelope=make_endpoint_registry_response_envelope(
-                            decision,
+                            mutation.response,
                             envelope,
                         ),
                         kind="provider.registry_response",
                     )
                 )
                 reserved = False
+                _ = self._finish_unclaimed_for_removed_locked(
+                    mutation.removed,
+                    observed_at=processed_at,
+                )
             finally:
                 if reserved:
                     self._release_outbound_slots_locked()
@@ -526,13 +563,25 @@ class ToolGatewayService:
         future: Future[ToolEnvelope] = Future()
         deadline = observation + effective_timeout / 1_000
         with self._lock:
-            self._ensure_accepting_locked()
-            pending_key = self._admit_invoke_locked(
-                request,
-                processed_at=observation,
-                deadline=deadline,
-                future=future,
-            )
+            try:
+                pending_key = self._admit_invoke_locked(
+                    request,
+                    processed_at=observation,
+                    deadline=deadline,
+                    future=future,
+                )
+            except ToolGatewayUnavailable as error:
+                pending_key = None
+                self._complete_without_pending_locked(
+                    request,
+                    self._tool_error(
+                        "FORGE_TOOL_GATEWAY_UNAVAILABLE",
+                        str(error),
+                        retryable=True,
+                    ),
+                    future,
+                    terminal_slot_reserved=False,
+                )
         return ToolInvocationTicket(
             request=request,
             future=future,
@@ -584,8 +633,6 @@ class ToolGatewayService:
                 self._reserve_outbound_slots_locked()
                 provider_reserved = True
             except ToolGatewayMailboxFull:
-                if not terminal_reserved:
-                    raise
                 complete(
                     self._tool_error(
                         "FORGE_TOOL_GATEWAY_BUSY",
@@ -618,8 +665,13 @@ class ToolGatewayService:
                     )
                 )
                 return None
+            expired = self._directory.expire(processed_at)
+            _ = self._finish_unclaimed_for_removed_locked(
+                expired,
+                observed_at=processed_at,
+            )
             try:
-                registration = self.directory.resolve(
+                registration = self._directory.resolve(
                     endpoint_id,
                     operation,
                     now=processed_at,
@@ -641,7 +693,7 @@ class ToolGatewayService:
             provider_request = make_invoke_request_envelope(
                 tool_request,
                 context,
-                request_id=logical_request.request_id or "",
+                request_id=f"gateway-provider-{uuid.uuid4().hex}",
                 endpoint_instance_id=registration.endpoint_instance_id,
             )
             logical_key = self._correlation_key(logical_request)
@@ -775,6 +827,59 @@ class ToolGatewayService:
             ),
             pending.logical_request,
         )
+
+    def _finish_unclaimed_for_removed_locked(
+        self,
+        removed: tuple[RegisteredEndpoint, ...],
+        *,
+        observed_at: float,
+    ) -> tuple[int, int]:
+        if not removed:
+            return 0, 0
+        removed_routes = {
+            (
+                registration.endpoint_id,
+                registration.endpoint_instance_id,
+                registration.route,
+            )
+            for registration in removed
+        }
+        affected = tuple(
+            pending
+            for pending in self._pending_by_provider_key.values()
+            if not pending.dispatch_claimed
+            and (
+                pending.provider_request.endpoint_id,
+                pending.provider_request.endpoint_instance_id,
+                pending.route,
+            )
+            in removed_routes
+        )
+        completed = 0
+        timed_out = 0
+        for pending in affected:
+            endpoint_id = pending.provider_request.endpoint_id
+            instance_id = pending.provider_request.endpoint_instance_id
+            assert endpoint_id is not None
+            assert instance_id is not None
+            response = _logical_error_response(
+                self._tool_error(
+                    "FORGE_TOOL_ENDPOINT_UNAVAILABLE",
+                    f"endpoint {endpoint_id!r} instance {instance_id!r} "
+                    "became unavailable before provider dispatch",
+                    retryable=True,
+                ),
+                pending.logical_request,
+            )
+            deadline_elapsed = observed_at >= pending.deadline
+            if self._finish_pending_locked(
+                pending,
+                response,
+                observed_at=observed_at,
+            ):
+                completed += 1
+                timed_out += int(deadline_elapsed)
+        return completed, timed_out
 
     def _remove_pending_locked(self, pending: _PendingInvocation) -> None:
         current = self._pending_by_provider_key.get(pending.provider_key)
@@ -934,13 +1039,17 @@ class ToolGatewayService:
                 if explicit_observation is None
                 else explicit_observation
             )
-            expired = self.directory.expire(observation)
+            expired = self._directory.expire(observation)
+            _, transition_timeouts = self._finish_unclaimed_for_removed_locked(
+                expired,
+                observed_at=observation,
+            )
             timed_out = tuple(
                 pending
                 for pending in self._pending_by_provider_key.values()
                 if pending.deadline <= observation
             )
-            completed = 0
+            completed = transition_timeouts
             for pending in timed_out:
                 response = _logical_error_response(
                     self._tool_error(

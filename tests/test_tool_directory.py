@@ -130,7 +130,7 @@ def test_new_instance_on_same_route_atomically_replaces_current() -> None:
     directory = EndpointDirectory()
     directory.register(registration(), route(), now=1.0)
 
-    replacement = directory.register(
+    mutation = directory.register_with_change(
         registration(
             instance_id="instance-2",
             operation="segment",
@@ -140,8 +140,10 @@ def test_new_instance_on_same_route_atomically_replaces_current() -> None:
         now=2.0,
     )
 
+    replacement = mutation.response
     assert replacement.status == "accepted"
     assert replacement.registry_revision == 2
+    assert [item.endpoint_instance_id for item in mutation.removed] == ["instance-1"]
     current = directory.resolve("vision.yolo", "segment", now=2.0)
     assert current is not None
     assert current.endpoint_instance_id == "instance-2"
@@ -193,16 +195,20 @@ def test_matching_unregister_removes_and_absent_unregister_is_effect_idempotent(
     directory = EndpointDirectory()
     directory.register(registration(), route(), now=1.0)
 
-    removed = directory.unregister(unregister(), route(), now=2.0)
-    absent = directory.unregister(
+    removal = directory.unregister_with_change(unregister(), route(), now=2.0)
+    replay = directory.unregister_with_change(
         unregister(request_id="unregister-2"),
         route(),
         now=3.0,
     )
 
+    removed = removal.response
+    absent = replay.response
     assert removed.status == absent.status == "accepted"
     assert removed.registry_revision == absent.registry_revision == 2
     assert removed.lease_ttl_ms is None
+    assert [item.endpoint_instance_id for item in removal.removed] == ["instance-1"]
+    assert replay.removed == ()
     assert directory.registrations(now=3.0) == ()
 
 

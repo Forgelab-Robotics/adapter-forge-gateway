@@ -246,7 +246,8 @@ def test_tools_defaults_and_runtime_input_indexes() -> None:
     assert default.tools.providers == []
     disabled_runtime = GatewayRuntime(default)
     try:
-        assert disabled_runtime.tool_gateway.directory.lease_ttl_ms == 15_000
+        assert disabled_runtime.tool_gateway.lease_ttl_ms == 15_000
+        assert not hasattr(disabled_runtime.tool_gateway, "directory")
         assert disabled_runtime.tool_input_ids == frozenset()
     finally:
         disabled_runtime.close()
@@ -258,7 +259,7 @@ def test_tools_defaults_and_runtime_input_indexes() -> None:
         assert runtime.tool_input_ids == frozenset(
             {"yolo/to_gateway", "caller/tool_request"}
         )
-        assert runtime.action_registry is not runtime.tool_gateway.directory
+        assert runtime.action_registry is not runtime.tool_gateway
     finally:
         runtime.close()
 
@@ -446,7 +447,7 @@ def test_provider_register_ack_uses_shared_output_and_is_not_public() -> None:
         decision = endpoint_registry_response_from_payload(response.payload)
         assert decision.status == "accepted"
         assert decision.registry_revision == 1
-        assert runtime.tool_gateway.directory.registrations(now=10.0)
+        assert runtime.tool_gateway.endpoint_registrations(now=10.0)
     finally:
         runtime.close()
 
@@ -487,7 +488,7 @@ def test_register_announce_renews_and_new_instance_replaces_without_heartbeat() 
         replaced = endpoint_registry_response_from_payload(replaced_ack.envelope.payload)
         assert first.registry_revision == renewed.registry_revision == 1
         assert replaced.registry_revision == 2
-        current = runtime.tool_gateway.directory.resolve(
+        current = runtime.tool_gateway.resolve_registered_endpoint(
             "vision.yolo", "detect", now=10.6
         )
         assert current is not None
@@ -544,6 +545,7 @@ def test_instance_less_caller_request_is_pinned_only_for_provider() -> None:
         assert outbound.output_id == "gateway/to_yolo"
         assert outbound.envelope.message_type == "tool.invoke.request"
         assert outbound.envelope.endpoint_instance_id == "instance-1"
+        assert outbound.envelope.request_id != caller_request.request_id
         request, context = invoke_request_from_envelope(outbound.envelope)
         assert request.arguments == {"image_id": "front"}
         assert context.caller_id == "dora:test"
@@ -684,6 +686,74 @@ def test_pending_invocation_expires_into_correlated_timeout_error() -> None:
         runtime.close()
 
 
+def test_private_provider_request_id_prevents_late_response_aba() -> None:
+    service = ToolGatewayService(_config(invoke_timeout_ms=1_000).tools)
+    service.handle_input(
+        "yolo/to_gateway",
+        _registration(),
+        received_at=1.0,
+    )
+    assert service.take_outbound() is not None
+    first_request = _invoke_request(arguments={"generation": "first"})
+    service.handle_input(
+        "caller/tool_request",
+        first_request,
+        received_at=2.0,
+    )
+    first_provider_request = service.take_outbound()
+    assert first_provider_request is not None
+
+    sweep = service.sweep(now=3.0)
+    first_timeout = service.take_outbound()
+    assert sweep.timed_out_invocations == 1
+    assert first_timeout is not None
+    assert error_from_payload(first_timeout.envelope.payload).code == (
+        "FORGE_TOOL_INVOKE_TIMEOUT"
+    )
+
+    second_request = _invoke_request(arguments={"generation": "second"})
+    service.handle_input(
+        "caller/tool_request",
+        second_request,
+        received_at=3.1,
+    )
+    second_provider_request = service.take_outbound()
+    assert second_provider_request is not None
+    assert (
+        first_provider_request.envelope.request_id
+        != second_provider_request.envelope.request_id
+    )
+
+    late_response = make_invoke_response_envelope(
+        ToolResult(status="succeeded", outputs={"generation": "first"}),
+        first_provider_request.envelope,
+    )
+    service.handle_input(
+        "yolo/to_gateway",
+        late_response,
+        received_at=3.2,
+    )
+    assert service.pending_count == 1
+    assert service.take_outbound() is None
+
+    current_response = make_invoke_response_envelope(
+        ToolResult(status="succeeded", outputs={"generation": "second"}),
+        second_provider_request.envelope,
+    )
+    service.handle_input(
+        "yolo/to_gateway",
+        current_response,
+        received_at=3.3,
+    )
+    caller_response = service.take_outbound()
+    assert caller_response is not None
+    validate_response_correlation(second_request, caller_response.envelope)
+    assert caller_response.envelope.payload["result"]["outputs"] == {
+        "generation": "second"
+    }
+    assert service.pending_count == 0
+
+
 def test_unknown_operation_and_inactive_endpoint_return_public_errors() -> None:
     runtime = GatewayRuntime(_config())
     try:
@@ -772,7 +842,7 @@ def test_runner_processes_tool_input_and_sends_only_on_lifecycle_thread() -> Non
         )
 
         assert node.send_thread_ids == [lifecycle_thread_id]
-        current = runtime.tool_gateway.directory.resolve(
+        current = runtime.tool_gateway.resolve_registered_endpoint(
             "vision.yolo", "detect", now=received_at + 0.1
         )
         assert current is not None
@@ -1061,7 +1131,24 @@ def test_http_reports_bounded_outbound_mailbox_backpressure_as_503() -> None:
     )
 
     assert response.status_code == 503
-    assert "mailbox capacity 1" in response.json()["msg"]
+    assert response.json()["error"]["code"] == "FORGE_TOOL_GATEWAY_BUSY"
+    assert response.json()["error"]["retryable"] is True
+
+
+def test_http_closed_gateway_returns_structured_unavailable_error() -> None:
+    service = ToolGatewayService(_config().tools)
+    service.begin_close(now=1.0)
+    app = FastAPI()
+    register_tool_routes(app, SimpleNamespace(tool_gateway=service))
+
+    response = TestClient(app).post(
+        "/tools/vision.yolo/detect:invoke",
+        json={"arguments": {}},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "FORGE_TOOL_GATEWAY_UNAVAILABLE"
+    assert response.json()["error"]["retryable"] is True
 
 
 def test_pending_capacity_remains_full_after_http_dispatch_claim() -> None:
@@ -1152,10 +1239,10 @@ def test_registration_replacement_does_not_mutate_without_ack_capacity() -> None
             received_at=2.0,
         )
 
-    current = service.directory.resolve("vision.yolo", "detect", now=2.0)
+    current = service.resolve_registered_endpoint("vision.yolo", "detect", now=2.0)
     assert current is not None
     assert current.endpoint_instance_id == "instance-1"
-    assert service.directory.revision == 1
+    assert service.registry_revision == 1
     assert service.outbound_count == 1
     assert service.reserved_outbound_count == 0
 
@@ -1190,7 +1277,7 @@ def test_dora_invoke_with_no_response_slot_rejects_without_resolution() -> None:
         _registration(),
         received_at=1.0,
     )
-    revision = service.directory.revision
+    revision = service.registry_revision
 
     with pytest.raises(ToolGatewayMailboxFull):
         service.handle_input(
@@ -1199,7 +1286,7 @@ def test_dora_invoke_with_no_response_slot_rejects_without_resolution() -> None:
             received_at=2.0,
         )
 
-    assert service.directory.revision == revision
+    assert service.registry_revision == revision
     assert service.pending_count == 0
     assert service.reserved_outbound_count == 0
 
@@ -1319,7 +1406,7 @@ def test_registry_effects_continue_using_reader_receive_time() -> None:
         processed_at=20.0,
     )
     assert service.take_outbound() is not None
-    registration = service.directory.registrations(now=10.5)[0]
+    registration = service.endpoint_registrations(now=10.5)[0]
     assert registration.expires_at == 11.0
 
     stale_unregister = make_unregister_envelope(
@@ -1339,7 +1426,7 @@ def test_registry_effects_continue_using_reader_receive_time() -> None:
     assert decision.status == "rejected"
     assert decision.error is not None
     assert decision.error.code == "FORGE_ENDPOINT_INSTANCE_STALE"
-    assert service.directory.registrations(now=10.75) == (registration,)
+    assert service.endpoint_registrations(now=10.75) == (registration,)
 
 
 def test_query_deadline_uses_lifecycle_processing_time() -> None:
@@ -1513,6 +1600,143 @@ def test_timeout_or_close_before_dispatch_claim_skips_provider_send(
     assert node.outputs == []
     assert service.pending_count == 0
     assert service.outbound_count == 0
+
+
+@pytest.mark.parametrize("transition", ["expiry", "unregister", "replacement"])
+def test_endpoint_transition_before_claim_skips_stale_provider_request(
+    transition: str,
+) -> None:
+    service = ToolGatewayService(
+        _config(lease_ttl_ms=100, invoke_timeout_ms=5_000).tools
+    )
+    service.handle_input(
+        "yolo/to_gateway",
+        _registration(),
+        received_at=1.0,
+    )
+    assert service.take_outbound() is not None
+    ticket = service.submit_http_invoke("vision.yolo", "detect", {}, now=1.05)
+
+    if transition == "expiry":
+        sweep = service.sweep(now=1.1)
+        assert [item.endpoint_instance_id for item in sweep.expired_registrations] == [
+            "instance-1"
+        ]
+    elif transition == "unregister":
+        service.handle_input(
+            "yolo/to_gateway",
+            make_unregister_envelope(
+                endpoint_id="vision.yolo",
+                endpoint_instance_id="instance-1",
+                request_id="unregister-transition",
+            ),
+            received_at=1.06,
+            processed_at=1.06,
+        )
+        management_response = service.take_outbound()
+        assert management_response is not None
+        assert management_response.kind == "provider.registry_response"
+    else:
+        service.handle_input(
+            "yolo/to_gateway",
+            _registration(
+                instance_id="instance-2",
+                request_id="register-replacement",
+            ),
+            received_at=1.06,
+            processed_at=1.06,
+        )
+        management_response = service.take_outbound()
+        assert management_response is not None
+        assert management_response.kind == "provider.registry_response"
+
+    response = ticket.future.result(timeout=0.1)
+    assert error_from_payload(response.payload).code == (
+        "FORGE_TOOL_ENDPOINT_UNAVAILABLE"
+    )
+    assert service.pending_count == 0
+    assert service.take_outbound() is None
+
+
+def test_expiry_fencing_at_elapsed_deadline_counts_timeout() -> None:
+    service = ToolGatewayService(
+        _config(lease_ttl_ms=100, invoke_timeout_ms=1_000).tools
+    )
+    service.handle_input(
+        "yolo/to_gateway",
+        _registration(),
+        received_at=1.0,
+    )
+    assert service.take_outbound() is not None
+    ticket = service.submit_http_invoke("vision.yolo", "detect", {}, now=1.05)
+
+    sweep = service.sweep(now=3.0)
+
+    response = ticket.future.result(timeout=0.1)
+    assert error_from_payload(response.payload).code == "FORGE_TOOL_INVOKE_TIMEOUT"
+    assert sweep.timed_out_invocations == 1
+    assert service.pending_count == 0
+    assert service.take_outbound() is None
+
+
+@pytest.mark.parametrize("transition", ["expiry", "unregister", "replacement"])
+def test_claimed_query_can_complete_after_endpoint_transition(transition: str) -> None:
+    service = ToolGatewayService(
+        _config(lease_ttl_ms=100, invoke_timeout_ms=5_000).tools
+    )
+    service.handle_input(
+        "yolo/to_gateway",
+        _registration(),
+        received_at=1.0,
+    )
+    assert service.take_outbound() is not None
+    ticket = service.submit_http_invoke("vision.yolo", "detect", {}, now=1.05)
+    provider_request = service.take_outbound()
+    assert provider_request is not None
+    assert provider_request.kind == "provider.invoke_request"
+
+    if transition == "expiry":
+        service.sweep(now=1.1)
+    elif transition == "unregister":
+        service.handle_input(
+            "yolo/to_gateway",
+            make_unregister_envelope(
+                endpoint_id="vision.yolo",
+                endpoint_instance_id="instance-1",
+                request_id="unregister-transition",
+            ),
+            received_at=1.06,
+            processed_at=1.06,
+        )
+        assert service.take_outbound() is not None
+    else:
+        service.handle_input(
+            "yolo/to_gateway",
+            _registration(
+                instance_id="instance-2",
+                request_id="register-replacement",
+            ),
+            received_at=1.06,
+            processed_at=1.06,
+        )
+        assert service.take_outbound() is not None
+
+    assert service.pending_count == 1
+    assert ticket.future.done() is False
+    provider_response = make_invoke_response_envelope(
+        ToolResult(status="succeeded", outputs={"instance": "old"}),
+        provider_request.envelope,
+    )
+    service.handle_input(
+        "yolo/to_gateway",
+        provider_response,
+        received_at=1.2,
+        processed_at=1.2,
+    )
+
+    response = ticket.future.result(timeout=0.1)
+    assert response.payload["result"]["outputs"] == {"instance": "old"}
+    assert service.pending_count == 0
 
 
 def test_dispatch_claim_before_cancel_may_send_but_timeout_remains_authoritative() -> None:
@@ -1695,7 +1919,7 @@ def test_begin_close_rejects_provider_management_before_directory_mutation() -> 
             received_at=1.0,
         )
 
-    assert service.directory.registrations(now=1.0) == ()
+    assert service.endpoint_registrations(now=1.0) == ()
     assert service.outbound_count == 0
 
 

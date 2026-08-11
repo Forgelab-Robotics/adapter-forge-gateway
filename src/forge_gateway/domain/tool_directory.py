@@ -57,6 +57,14 @@ class ToolDirectorySnapshot:
     registrations: tuple[RegisteredEndpoint, ...]
 
 
+@dataclass(frozen=True)
+class EndpointDirectoryMutation:
+    """One management decision and the registrations it removed."""
+
+    response: EndpointRegistryResponse
+    removed: tuple[RegisteredEndpoint, ...]
+
+
 class ToolOperationNotFoundError(LookupError):
     """The active endpoint descriptor does not expose a requested Query operation."""
 
@@ -184,6 +192,16 @@ class EndpointDirectory:
         now: float,
     ) -> EndpointRegistryResponse:
         """Announce or renew one provider instance on its configured route."""
+        return self.register_with_change(request, route, now=now).response
+
+    def register_with_change(
+        self,
+        request: ToolEnvelope,
+        route: ToolProviderRouteIdentity,
+        *,
+        now: float,
+    ) -> EndpointDirectoryMutation:
+        """Announce or renew an instance and report registrations removed atomically."""
         if not isinstance(request, ToolEnvelope):
             raise TypeError("request must be a ToolEnvelope")
         if not isinstance(route, ToolProviderRouteIdentity):
@@ -218,18 +236,24 @@ class EndpointDirectory:
             self._ensure_revision_capacity_locked(len(expired) + additional_revision)
             self._apply_expired_locked(expired)
             if descriptor.endpoint_id != route.endpoint_id:
-                return self._rejected(
-                    "register",
-                    "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED",
-                    "the configured provider route is not authorized for this endpoint",
+                return EndpointDirectoryMutation(
+                    response=self._rejected(
+                        "register",
+                        "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED",
+                        "the configured provider route is not authorized for this endpoint",
+                    ),
+                    removed=expired,
                 )
             if any(
                 operation.semantics != "query" for operation in descriptor.operations
             ):
-                return self._rejected(
-                    "register",
-                    "FORGE_TOOL_SEMANTICS_UNSUPPORTED",
-                    "Gateway Tool providers may register Query operations only",
+                return EndpointDirectoryMutation(
+                    response=self._rejected(
+                        "register",
+                        "FORGE_TOOL_SEMANTICS_UNSUPPORTED",
+                        "Gateway Tool providers may register Query operations only",
+                    ),
+                    removed=expired,
                 )
 
             endpoint_instance_id = request.endpoint_instance_id
@@ -237,20 +261,26 @@ class EndpointDirectory:
             current = self._current.get(descriptor.endpoint_id)
             if current is not None:
                 if current.route != route:
-                    return self._rejected(
-                        "register",
-                        "FORGE_ENDPOINT_ROUTE_CONFLICT",
-                        "another configured provider route owns the current "
-                        "endpoint lease",
-                        retryable=True,
+                    return EndpointDirectoryMutation(
+                        response=self._rejected(
+                            "register",
+                            "FORGE_ENDPOINT_ROUTE_CONFLICT",
+                            "another configured provider route owns the current "
+                            "endpoint lease",
+                            retryable=True,
+                        ),
+                        removed=expired,
                     )
                 if current.endpoint_instance_id == endpoint_instance_id:
                     if current.descriptor != descriptor:
-                        return self._rejected(
-                            "register",
-                            "FORGE_ENDPOINT_DESCRIPTOR_CONFLICT",
-                            "the current endpoint instance cannot change its "
-                            "descriptor",
+                        return EndpointDirectoryMutation(
+                            response=self._rejected(
+                                "register",
+                                "FORGE_ENDPOINT_DESCRIPTOR_CONFLICT",
+                                "the current endpoint instance cannot change its "
+                                "descriptor",
+                            ),
+                            removed=expired,
                         )
                     self._current[descriptor.endpoint_id] = RegisteredEndpoint(
                         descriptor=current.descriptor,
@@ -259,8 +289,12 @@ class EndpointDirectory:
                         registry_revision=current.registry_revision,
                         expires_at=current_time + self._lease_ttl_seconds,
                     )
-                    return self._accepted("register", lease=True)
+                    return EndpointDirectoryMutation(
+                        response=self._accepted("register", lease=True),
+                        removed=expired,
+                    )
 
+            removed = expired if current is None else (*expired, current)
             revision = self._next_revision_locked()
             self._current[descriptor.endpoint_id] = RegisteredEndpoint(
                 descriptor=descriptor,
@@ -269,7 +303,10 @@ class EndpointDirectory:
                 registry_revision=revision,
                 expires_at=current_time + self._lease_ttl_seconds,
             )
-            return self._accepted("register", lease=True)
+            return EndpointDirectoryMutation(
+                response=self._accepted("register", lease=True),
+                removed=removed,
+            )
 
     def unregister(
         self,
@@ -279,6 +316,16 @@ class EndpointDirectory:
         now: float,
     ) -> EndpointRegistryResponse:
         """Remove a matching registration; absence is effect-idempotent."""
+        return self.unregister_with_change(request, route, now=now).response
+
+    def unregister_with_change(
+        self,
+        request: ToolEnvelope,
+        route: ToolProviderRouteIdentity,
+        *,
+        now: float,
+    ) -> EndpointDirectoryMutation:
+        """Remove a matching registration and report every atomically removed lease."""
         if not isinstance(request, ToolEnvelope):
             raise TypeError("request must be a ToolEnvelope")
         if not isinstance(route, ToolProviderRouteIdentity):
@@ -303,36 +350,54 @@ class EndpointDirectory:
             self._ensure_revision_capacity_locked(len(expired) + int(removes_current))
             self._apply_expired_locked(expired)
             if request.endpoint_id != route.endpoint_id:
-                return self._rejected(
-                    "unregister",
-                    "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED",
-                    "the configured provider route is not authorized for this endpoint",
+                return EndpointDirectoryMutation(
+                    response=self._rejected(
+                        "unregister",
+                        "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED",
+                        "the configured provider route is not authorized for this endpoint",
+                    ),
+                    removed=expired,
                 )
             endpoint_instance_id = request.endpoint_instance_id
             if endpoint_instance_id is None:
-                return self._rejected(
-                    "unregister",
-                    "FORGE_PROTOCOL_INVALID_MESSAGE",
-                    "endpoint.unregister requires endpoint_instance_id",
+                return EndpointDirectoryMutation(
+                    response=self._rejected(
+                        "unregister",
+                        "FORGE_PROTOCOL_INVALID_MESSAGE",
+                        "endpoint.unregister requires endpoint_instance_id",
+                    ),
+                    removed=expired,
                 )
             current = self._current.get(route.endpoint_id)
             if current is None:
-                return self._accepted("unregister", lease=False)
+                return EndpointDirectoryMutation(
+                    response=self._accepted("unregister", lease=False),
+                    removed=expired,
+                )
             if current.route != route:
-                return self._rejected(
-                    "unregister",
-                    "FORGE_ENDPOINT_ROUTE_CONFLICT",
-                    "another configured provider route owns the current endpoint lease",
+                return EndpointDirectoryMutation(
+                    response=self._rejected(
+                        "unregister",
+                        "FORGE_ENDPOINT_ROUTE_CONFLICT",
+                        "another configured provider route owns the current endpoint lease",
+                    ),
+                    removed=expired,
                 )
             if current.endpoint_instance_id != endpoint_instance_id:
-                return self._rejected(
-                    "unregister",
-                    "FORGE_ENDPOINT_INSTANCE_STALE",
-                    "the instance does not own the current endpoint lease",
+                return EndpointDirectoryMutation(
+                    response=self._rejected(
+                        "unregister",
+                        "FORGE_ENDPOINT_INSTANCE_STALE",
+                        "the instance does not own the current endpoint lease",
+                    ),
+                    removed=expired,
                 )
             self._next_revision_locked()
             del self._current[current.endpoint_id]
-            return self._accepted("unregister", lease=False)
+            return EndpointDirectoryMutation(
+                response=self._accepted("unregister", lease=False),
+                removed=(*expired, current),
+            )
 
     def resolve(
         self,
@@ -378,6 +443,7 @@ class EndpointDirectory:
 
 __all__ = [
     "EndpointDirectory",
+    "EndpointDirectoryMutation",
     "RegisteredEndpoint",
     "ToolDirectorySnapshot",
     "ToolOperationNotFoundError",

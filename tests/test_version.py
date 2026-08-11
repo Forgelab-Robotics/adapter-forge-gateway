@@ -30,6 +30,6 @@ def test_forge_dependencies_use_immutable_compatible_sources() -> None:
     assert "forge-common>=1.0.0,<2" in dependencies
     assert "forge-tool[dora]>=0.1.0,<0.2" in dependencies
     assert sources["forge-common"]["tag"] == "forge-common-v1.0.0"
-    expected_revision = "446d12d12f7760540369919582f78efb6c6f5ce7"
+    expected_revision = "b4c13e8b37afd1825c3b55fc70149757dc827c66"
     assert sources["forge-msgs"]["rev"] == expected_revision
     assert sources["forge-tool"]["rev"] == expected_revision
