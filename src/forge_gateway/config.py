@@ -13,12 +13,19 @@ import yaml
 
 from forge_gateway.adapters.manifest_loader import (
     default_action_manifests as _default_action_manifests,
+)
+from forge_gateway.adapters.manifest_loader import (
     load_action_manifest,
     load_action_manifests,
+)
+from forge_gateway.adapters.manifest_loader import (
     read_frontmatter as _read_frontmatter,  # noqa: F401 - top-level compatibility shim
+)
+from forge_gateway.adapters.manifest_loader import (
     resolve_path as _resolve_path,
 )
 from forge_gateway.domain.action_manifest import ActionDefinition as AgentActionConfig
+from forge_gateway.domain.tool_catalog import RobotFrameProfile, ToolSpec
 
 __all__ = [
     "AgentActionConfig",
@@ -75,12 +82,14 @@ _TOOL_GATEWAY_CONFIG_KEYS = frozenset(
         "invoke_timeout_ms",
         "request_input_id",
         "response_output_id",
+        "invocation_capacity",
+        "event_capacity",
+        "retention_sec",
+        "specs",
         "providers",
     }
 )
-_TOOL_PROVIDER_ROUTE_CONFIG_KEYS = frozenset(
-    {"endpoint_id", "input_id", "output_id"}
-)
+_TOOL_PROVIDER_ROUTE_CONFIG_KEYS = frozenset({"endpoint_id", "input_id", "output_id"})
 _MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 _RESERVED_GATEWAY_INPUT_IDS = frozenset(
     {
@@ -352,13 +361,17 @@ class ToolProviderRouteConfig:
 
 @dataclass(frozen=True)
 class ToolGatewayConfig:
-    """Gateway-owned Tool discovery and Query invocation configuration."""
+    """Gateway-owned Tool discovery and Query/Action invocation configuration."""
 
     enabled: bool = False
     lease_ttl_ms: int = 15_000
     invoke_timeout_ms: int = 5_000
     request_input_id: str = "tool_request"
     response_output_id: str = "tool_response"
+    invocation_capacity: int = 128
+    event_capacity: int = 128
+    retention_sec: float = 300.0
+    specs: list[ToolSpec] = field(default_factory=list)
     providers: list[ToolProviderRouteConfig] = field(default_factory=list)
 
     @classmethod
@@ -383,6 +396,31 @@ class ToolGatewayConfig:
             data.get("response_output_id", "tool_response"),
             "tools.response_output_id",
         )
+        invocation_capacity = _positive_safe_integer(
+            data.get("invocation_capacity", 128), "tools.invocation_capacity"
+        )
+        event_capacity = _positive_safe_integer(
+            data.get("event_capacity", 128), "tools.event_capacity"
+        )
+        retention_sec = _require_finite_float(
+            data.get("retention_sec", 300.0), "tools.retention_sec"
+        )
+        if retention_sec < 0:
+            raise ValueError("tools.retention_sec must be non-negative")
+        specs_raw = data.get("specs", [])
+        if not isinstance(specs_raw, list):
+            raise ValueError("tools.specs must be a list")
+        specs = [
+            _tool_spec_from_dict(spec, context=f"tools.specs[{index}]")
+            for index, spec in enumerate(specs_raw)
+        ]
+        if len({spec.tool_id for spec in specs}) != len(specs):
+            raise ValueError("tools.specs tool_id values must be unique")
+        bindings = [(spec.endpoint_id, spec.operation) for spec in specs]
+        if len(set(bindings)) != len(bindings):
+            raise ValueError(
+                "tools.specs endpoint_id/operation bindings must be unique"
+            )
         providers_raw = data.get("providers", [])
         if not isinstance(providers_raw, list):
             raise ValueError("tools.providers must be a list")
@@ -402,10 +440,152 @@ class ToolGatewayConfig:
             invoke_timeout_ms=invoke_timeout_ms,
             request_input_id=request_input_id,
             response_output_id=response_output_id,
+            invocation_capacity=invocation_capacity,
+            event_capacity=event_capacity,
+            retention_sec=retention_sec,
+            specs=specs,
             providers=providers,
         )
+        configured_endpoints = {provider.endpoint_id for provider in providers}
+        unbound_specs = [
+            spec.tool_id
+            for spec in specs
+            if spec.endpoint_id not in configured_endpoints
+        ]
+        if enabled and unbound_specs:
+            raise ValueError(
+                "tools.specs reference unconfigured endpoint(s): "
+                + ", ".join(sorted(unbound_specs))
+            )
         _validate_tool_port_ids(config)
         return config
+
+
+_TOOL_SPEC_KEYS = frozenset(
+    {
+        "tool_id",
+        "implementation_id",
+        "endpoint_id",
+        "operation",
+        "semantics",
+        "description",
+        "input_schema",
+        "output_schema",
+        "readiness",
+        "robot_frame_profile",
+    }
+)
+_ROBOT_FRAME_PROFILE_KEYS = frozenset(
+    {"robot_id", "base_frame", "tool_frame", "frames", "directions"}
+)
+_ROBOT_DIRECTION_KEYS = frozenset({"frame", "axis", "sign"})
+
+
+def _tool_spec_from_dict(data: Any, *, context: str) -> ToolSpec:
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{context} must be a YAML mapping")
+    _reject_unknown_keys(data, _TOOL_SPEC_KEYS, context)
+    required = ("tool_id", "implementation_id", "endpoint_id", "operation", "semantics")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"missing {context} config key(s): {', '.join(missing)}")
+    input_schema = data.get("input_schema", {})
+    output_schema = data.get("output_schema", {})
+    if not isinstance(input_schema, Mapping) or not isinstance(output_schema, Mapping):
+        raise ValueError(f"{context} schemas must be YAML mappings")
+    readiness_raw = data.get("readiness", [])
+    readiness = tuple(
+        _require_unique_non_empty_strings(readiness_raw, f"{context}.readiness")
+    )
+    frame_raw = data.get("robot_frame_profile")
+    frame_profile = (
+        None
+        if frame_raw is None
+        else _robot_frame_profile_from_dict(
+            frame_raw, context=f"{context}.robot_frame_profile"
+        )
+    )
+    return ToolSpec(
+        tool_id=_require_non_blank_string(data["tool_id"], f"{context}.tool_id"),
+        implementation_id=_require_non_blank_string(
+            data["implementation_id"], f"{context}.implementation_id"
+        ),
+        endpoint_id=_require_non_blank_string(
+            data["endpoint_id"], f"{context}.endpoint_id"
+        ),
+        operation=_require_non_blank_string(data["operation"], f"{context}.operation"),
+        semantics=_require_non_blank_string(data["semantics"], f"{context}.semantics"),
+        description=data.get("description", ""),
+        input_schema=dict(input_schema),
+        output_schema=dict(output_schema),
+        readiness=readiness,
+        robot_frame_profile=frame_profile,
+    )
+
+
+def _robot_frame_profile_from_dict(data: Any, *, context: str) -> RobotFrameProfile:
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{context} must be a YAML mapping")
+    _reject_unknown_keys(data, _ROBOT_FRAME_PROFILE_KEYS, context)
+    if "robot_id" not in data or "base_frame" not in data:
+        raise ValueError(f"{context} requires robot_id and base_frame")
+    frames = data.get("frames", {})
+    if not isinstance(frames, Mapping):
+        raise ValueError(f"{context}.frames must be a YAML mapping")
+    directions = _robot_directions_from_dict(
+        data.get("directions", {}), context=f"{context}.directions"
+    )
+    tool_frame = data.get("tool_frame")
+    return RobotFrameProfile(
+        robot_id=_require_non_blank_string(data["robot_id"], f"{context}.robot_id"),
+        base_frame=_require_non_blank_string(
+            data["base_frame"], f"{context}.base_frame"
+        ),
+        tool_frame=(
+            None
+            if tool_frame is None
+            else _require_non_blank_string(tool_frame, f"{context}.tool_frame")
+        ),
+        frames=dict(frames),
+        directions=directions,
+    )
+
+
+def _robot_directions_from_dict(
+    data: Any, *, context: str
+) -> dict[str, dict[str, str | int]]:
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{context} must be a YAML mapping")  # noqa: TRY004
+    directions: dict[str, dict[str, str | int]] = {}
+    for raw_name, raw_direction in data.items():
+        name = _require_non_blank_string(raw_name, f"{context} direction name")
+        direction_context = f"{context}.{name}"
+        if not isinstance(raw_direction, Mapping):
+            raise ValueError(  # noqa: TRY004
+                f"{direction_context} must be a YAML mapping"
+            )
+        _reject_unknown_keys(raw_direction, _ROBOT_DIRECTION_KEYS, direction_context)
+        missing = sorted(_ROBOT_DIRECTION_KEYS - set(raw_direction))
+        if missing:
+            raise ValueError(
+                f"missing {direction_context} config key(s): {', '.join(missing)}"
+            )
+        axis = _require_non_blank_string(
+            raw_direction["axis"], f"{direction_context}.axis"
+        )
+        if axis not in ("x", "y", "z"):
+            raise ValueError(f"{direction_context}.axis must be x, y, or z")
+        sign = _require_int(raw_direction["sign"], f"{direction_context}.sign")
+        if sign not in (-1, 1):
+            raise ValueError(f"{direction_context}.sign must be -1 or 1")
+        directions[name] = {
+            "frame": _require_non_blank_string(
+                raw_direction["frame"], f"{direction_context}.frame"
+            ),
+            "axis": axis,
+            "sign": sign,
+        }
+    return directions
 
 
 def _positive_safe_integer(value: Any, field_name: str) -> int:
@@ -524,6 +704,7 @@ class GatewayConfig:
             else data.get("broadcast_hz", 50.0)
         )
         tools = ToolGatewayConfig.from_dict(data.get("tools"))
+        _validate_tool_readiness(tools, image_input_ids)
         _validate_tool_port_ids(tools, image_input_ids=image_input_ids)
         return cls(
             joint_order=joint_order,
@@ -568,6 +749,30 @@ class GatewayConfig:
 
 def _clamp_hz(value: float) -> float:
     return max(0.1, min(120.0, value))
+
+
+def _validate_tool_readiness(
+    tools: ToolGatewayConfig, image_input_ids: list[str]
+) -> None:
+    allowed = {
+        "proprio_state",
+        "ws:state",
+        "ws:images",
+        *(f"image:{image_id}" for image_id in image_input_ids),
+    }
+    invalid = sorted(
+        {
+            requirement
+            for spec in tools.specs
+            for requirement in spec.readiness
+            if requirement not in allowed
+        }
+    )
+    if invalid:
+        raise ValueError(
+            "tools.specs readiness contains unknown requirement(s): "
+            + ", ".join(invalid)
+        )
 
 
 def _load_action_manifests(paths: list[Path]) -> dict[str, AgentActionConfig]:

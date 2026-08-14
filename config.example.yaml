@@ -32,7 +32,7 @@ jpeg_quality: 85          # Web 端图像 JPEG 质量，范围 1-100。
 policy_id: default        # 展示/控制使用的策略标识，通常保持 default。
 command_queue_capacity: 256  # 普通出站命令上限；另保留一个 safety stop 槽位。
 
-# Gateway-owned Tool discovery and Query invocation is opt-in. Public callers
+# Gateway-owned Tool discovery and Query/Action invocation is opt-in. Public callers
 # use request_input_id/response_output_id and never provide endpoint_instance_id;
 # provider instances are private routing state. Each provider shares one input for
 # register/unregister/invoke.response/tool.error and one output for
@@ -41,6 +41,9 @@ tools:
   enabled: false
   lease_ttl_ms: 15000
   invoke_timeout_ms: 5000  # HTTP/Dora caller timeout 的最大值；caller 只能缩短。
+  invocation_capacity: 128 # active 与 retention 中 Action invocation 的总量硬上限。
+  event_capacity: 128      # 每个 Action invocation 保留的最新事件数。
+  retention_sec: 300       # terminal result/event 的内存保留时间。
   request_input_id: tool_request
   response_output_id: tool_response
   providers: []
@@ -48,6 +51,24 @@ tools:
   #   - endpoint_id: vision.yolo
   #     input_id: yolo/to_gateway
   #     output_id: gateway/to_yolo
+  specs: []
+  # specs:
+  #   - tool_id: robot.pick
+  #     implementation_id: piper.primary
+  #     endpoint_id: robot.piper
+  #     operation: pick
+  #     semantics: action
+  #     description: Pick one object.
+  #     input_schema: {}
+  #     output_schema: {}
+  #     readiness: [proprio_state]
+  #     robot_frame_profile:
+  #       robot_id: piper
+  #       base_frame: base
+  #       tool_frame: gripper
+  #       frames: {}
+  #       directions:
+  #         forward: {frame: base, axis: x, sign: 1}
 
 readiness:
   require_proprio_state: true   # true 时，收到本体状态后才允许 /runtime/start 生效。

@@ -20,19 +20,33 @@ from forge_tool import (
     ToolError,
     ToolExecutionKey,
     ToolRequest,
+    ToolResult,
+    control_response_from_payload,
     endpoint_descriptor_to_payload,
+    endpoint_status_from_envelope,
     error_from_payload,
     error_to_payload,
+    event_from_payload,
     invoke_request_from_envelope,
     invoke_request_to_payload,
     invoke_response_from_payload,
     make_endpoint_registry_response_envelope,
     make_invoke_request_envelope,
+    result_response_from_payload,
+    status_response_from_payload,
     validate_message_envelope,
     validate_response_correlation,
 )
 
 from forge_gateway.config import ToolGatewayConfig, ToolProviderRouteConfig
+from forge_gateway.domain.action_invocations import (
+    TERMINAL_PHASES,
+    ActionInvocation,
+    ActionInvocationCapacityError,
+    ActionInvocationStore,
+    ActionKey,
+)
+from forge_gateway.domain.tool_catalog import ToolSpec, ToolSpecCatalog
 from forge_gateway.domain.tool_directory import (
     EndpointDirectory,
     RegisteredEndpoint,
@@ -46,12 +60,17 @@ DEFAULT_TOOL_OUTBOUND_CAPACITY = 256
 LogicalToolMessageType = Literal[
     "tool.invoke.request",
     "tool.invoke.response",
+    "tool.status.response",
+    "tool.result.response",
+    "tool.control.response",
     "tool.error",
 ]
 ToolOutboundKind = Literal[
     "provider.registry_response",
     "provider.invoke_request",
     "caller.invoke_response",
+    "provider.action_request",
+    "caller.action_response",
 ]
 CorrelationKey = tuple[str, str, str, str, str | None, str]
 
@@ -104,6 +123,19 @@ class _PendingInvocation:
     deadline: float
     future: Future[ToolEnvelope] | None
     terminal_slot_reserved: bool
+    dispatch_claimed: bool = False
+
+
+@dataclass
+class _ActionExchange:
+    execution_key: ActionKey
+    provider_request: ToolEnvelope
+    route: ToolProviderRouteIdentity
+    provider_key: CorrelationKey
+    purpose: str
+    deadline: float
+    logical_request: ToolEnvelope | None = None
+    caller_response_reserved: bool = False
     dispatch_claimed: bool = False
 
 
@@ -178,8 +210,6 @@ def _logical_provider_response(
     assert request.attempt_id is not None
     assert request.endpoint_id is not None
     assert request.operation is not None
-    if response.message_type not in ("tool.invoke.response", "tool.error"):
-        raise ValueError("provider response must be invoke.response or tool.error")
     if request.endpoint_instance_id is not None:
         raise ValueError("logical caller request must not contain endpoint_instance_id")
     return _logical_envelope(
@@ -226,6 +256,15 @@ class ToolGatewayService:
         self._reserved_outbound_slots = 0
         self._pending_by_provider_key: dict[CorrelationKey, _PendingInvocation] = {}
         self._pending_logical_keys: set[CorrelationKey] = set()
+        self.catalog = ToolSpecCatalog(config.specs)
+        self.action_invocations = ActionInvocationStore(
+            capacity=config.invocation_capacity,
+            event_capacity=config.event_capacity,
+            retention_seconds=config.retention_sec,
+        )
+        self._action_exchanges: dict[CorrelationKey, _ActionExchange] = {}
+        self._endpoint_statuses: dict[tuple[str, str], dict[str, Any]] = {}
+        self._dora_action_event_cursors: dict[ActionKey, int] = {}
 
     @staticmethod
     def _route_identity(provider: ToolProviderRouteConfig) -> ToolProviderRouteIdentity:
@@ -378,6 +417,363 @@ class ToolGatewayService:
                 ],
             }
 
+    def tool_spec_snapshot(self, *, now: float | None = None) -> dict[str, object]:
+        """Return configured ToolSpecs with current descriptor binding state."""
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        with self._lock:
+            expired = self._directory.expire(observation)
+            self._finish_unclaimed_for_removed_locked(
+                expired, observed_at=observation
+            )
+            directory = self._directory.snapshot(now=observation)
+            registrations = {
+                registration.endpoint_id: registration
+                for registration in directory.registrations
+            }
+            tools: list[dict[str, Any]] = []
+            for spec in self.catalog.list():
+                value = spec.to_dict()
+                registration = registrations.get(spec.endpoint_id)
+                if registration is None:
+                    value["available"] = False
+                else:
+                    try:
+                        self.catalog.validate_binding(spec, registration)
+                        value["available"] = True
+                    except ValueError as error:
+                        value["available"] = False
+                        value["binding_error"] = str(error)
+                tools.append(value)
+            return {"revision": directory.revision, "tools": tools}
+
+    def get_tool_spec(self, tool_id: str) -> ToolSpec | None:
+        return self.catalog.get(tool_id)
+
+    def resolve_tool_spec(
+        self, tool_id: str, *, now: float | None = None
+    ) -> tuple[ToolSpec, RegisteredEndpoint]:
+        spec = self.catalog.get(tool_id)
+        if spec is None:
+            raise KeyError(tool_id)
+        registration = self.resolve_registered_endpoint(
+            spec.endpoint_id, spec.operation, now=now
+        )
+        if registration is None:
+            raise ToolGatewayUnavailable(
+                f"endpoint {spec.endpoint_id!r} has no active provider instance"
+            )
+        self.catalog.validate_binding(spec, registration)
+        return spec, registration
+
+    def submit_http_action(
+        self,
+        tool_id: str,
+        arguments: dict[str, object],
+        *,
+        caller_id: str | None = None,
+        timeout_ms: int | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Create, pin and dispatch one Action invocation without waiting."""
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        effective_timeout = self._validate_timeout_ms(
+            self.config.invoke_timeout_ms if timeout_ms is None else timeout_ms
+        )
+        if effective_timeout > self.config.invoke_timeout_ms:
+            raise ValueError(
+                "timeout_ms must not exceed configured tools.invoke_timeout_ms "
+                f"maximum {self.config.invoke_timeout_ms}"
+            )
+        spec, registration = self.resolve_tool_spec(tool_id, now=observation)
+        if spec.semantics != "action":
+            raise ValueError(f"ToolSpec {tool_id!r} is not an Action")
+        operation_descriptor = next(
+            item
+            for item in registration.descriptor.operations
+            if item.name == spec.operation
+        )
+        identity = uuid.uuid4().hex
+        invocation_id = f"gateway-{identity}"
+        attempt_id = f"gateway-{identity}"
+        deadline_ms = min(
+            _MAX_SAFE_JSON_INTEGER,
+            int(time.time() * 1_000) + effective_timeout,
+        )
+        context = ToolContext(
+            execution_key=ToolExecutionKey(invocation_id, attempt_id),
+            tool_id=spec.tool_id,
+            implementation_id=spec.implementation_id,
+            endpoint_id=spec.endpoint_id,
+            operation=spec.operation,
+            caller_id=caller_id,
+            deadline_ms=deadline_ms,
+        )
+        provider_request = make_invoke_request_envelope(
+            ToolRequest(arguments),
+            context,
+            request_id=f"gateway-provider-{uuid.uuid4().hex}",
+            endpoint_instance_id=registration.endpoint_instance_id,
+        )
+        invocation = ActionInvocation(
+            invocation_id=invocation_id,
+            attempt_id=attempt_id,
+            tool_id=spec.tool_id,
+            implementation_id=spec.implementation_id,
+            endpoint_id=spec.endpoint_id,
+            endpoint_instance_id=registration.endpoint_instance_id,
+            operation=spec.operation,
+            caller_id=caller_id,
+            deadline_ms=deadline_ms,
+            created_at=time.time(),
+        )
+        with self._lock:
+            self._ensure_accepting_locked()
+            current = self._directory.resolve(
+                spec.endpoint_id, spec.operation, now=observation
+            )
+            if (
+                current is None
+                or current.endpoint_instance_id != registration.endpoint_instance_id
+            ):
+                raise ToolGatewayUnavailable(
+                    "provider instance changed during Action admission"
+                )
+            self._reserve_outbound_slots_locked()
+            try:
+                self.action_invocations.create(
+                    invocation,
+                    now=observation,
+                    operation_capacity=operation_descriptor.max_concurrency,
+                )
+                self._queue_action_exchange_locked(
+                    invocation.key,
+                    provider_request,
+                    registration.route,
+                    purpose="invoke",
+                    deadline=observation + effective_timeout / 1_000,
+                )
+            except BaseException:
+                self._release_outbound_slots_locked()
+                self.action_invocations.discard(invocation.key)
+                raise
+        snapshot = self.action_invocations.snapshot(invocation.key, now=observation)
+        assert snapshot is not None
+        return snapshot
+
+    def _http_action_key(self, invocation_id: str, *, now: float) -> ActionKey | None:
+        return self.action_invocations.resolve_http_key(invocation_id, now=now)
+
+    def action_invocation_snapshot(
+        self, invocation_id: str, *, now: float | None = None
+    ) -> dict[str, Any] | None:
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        key = self._http_action_key(invocation_id, now=observation)
+        return (
+            None
+            if key is None
+            else self.action_invocations.snapshot(key, now=observation)
+        )
+
+    def action_result_snapshot(
+        self, invocation_id: str, *, now: float | None = None
+    ) -> dict[str, Any] | None:
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        key = self._http_action_key(invocation_id, now=observation)
+        return (
+            None
+            if key is None
+            else self.action_invocations.result_snapshot(key, now=observation)
+        )
+
+    def cancel_action(self, invocation_id: str, *, now: float | None = None) -> str:
+        """Request provider cancellation; acceptance never implies termination."""
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        with self._lock:
+            key = self._http_action_key(invocation_id, now=observation)
+            if key is None:
+                raise KeyError(invocation_id)
+            item = self.action_invocations.get(key, now=observation)
+            if item is None:
+                raise KeyError(invocation_id)
+            if item.phase in TERMINAL_PHASES:
+                return "terminal"
+            if item.cancel_status in (
+                "requested",
+                "accepted",
+                "terminal",
+                "unsupported",
+            ):
+                return item.cancel_status
+            if any(
+                exchange.execution_key == key and exchange.purpose == "cancel"
+                for exchange in self._action_exchanges.values()
+            ):
+                return item.cancel_status or "requested"
+            expired = self._directory.expire(observation)
+            self._finish_unclaimed_for_removed_locked(
+                expired, observed_at=observation
+            )
+            registration = self._directory.resolve(
+                item.endpoint_id, item.operation, now=observation
+            )
+            if (
+                registration is None
+                or registration.endpoint_instance_id != item.endpoint_instance_id
+            ):
+                self.action_invocations.mark_instance_ambiguous(
+                    item.endpoint_id,
+                    item.endpoint_instance_id,
+                    now=observation,
+                    reason="pinned provider instance is no longer current",
+                )
+                return "unknown"
+            operation = next(
+                entry
+                for entry in registration.descriptor.operations
+                if entry.name == item.operation
+            )
+            if not operation.cancellable:
+                return "unsupported"
+            request = ToolEnvelope(
+                protocol=TOOL_ENDPOINT_PROTOCOL,
+                message_type="tool.control.request",
+                request_id=f"gateway-provider-{uuid.uuid4().hex}",
+                invocation_id=item.invocation_id,
+                attempt_id=item.attempt_id,
+                endpoint_id=item.endpoint_id,
+                endpoint_instance_id=item.endpoint_instance_id,
+                operation=item.operation,
+                payload={"command": "cancel"},
+            )
+            self._reserve_outbound_slots_locked()
+            try:
+                self.action_invocations.set_cancel_status(key, "requested")
+                self._queue_action_exchange_locked(
+                    key,
+                    request,
+                    registration.route,
+                    purpose="cancel",
+                    deadline=observation + self.config.invoke_timeout_ms / 1_000,
+                )
+            except BaseException:
+                self._release_outbound_slots_locked()
+                self.action_invocations.set_cancel_status(key, "transport_error")
+                raise
+        return "requested"
+
+    def refresh_action(
+        self,
+        invocation_id: str,
+        purpose: Literal["status", "result"],
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Queue one bounded provider lookup for a retained pinned Action."""
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        with self._lock:
+            key = self._http_action_key(invocation_id, now=observation)
+            if key is None:
+                raise KeyError(invocation_id)
+            return self._refresh_action_key_locked(key, purpose, now=observation)
+
+    def _refresh_action_key_locked(
+        self,
+        key: ActionKey,
+        purpose: Literal["status", "result"],
+        *,
+        now: float,
+        logical_request: ToolEnvelope | None = None,
+        caller_response_reserved: bool = False,
+    ) -> bool:
+        item = self.action_invocations.get(key, now=now)
+        if item is None:
+            raise KeyError(key)
+        if any(
+            exchange.execution_key == key and exchange.purpose == purpose
+            for exchange in self._action_exchanges.values()
+        ):
+            return False
+        expired = self._directory.expire(now)
+        self._finish_unclaimed_for_removed_locked(expired, observed_at=now)
+        registration = self._directory.resolve(
+            item.endpoint_id, item.operation, now=now
+        )
+        if (
+            registration is None
+            or registration.endpoint_instance_id != item.endpoint_instance_id
+        ):
+            self.action_invocations.mark_instance_ambiguous(
+                item.endpoint_id,
+                item.endpoint_instance_id,
+                now=now,
+                reason="pinned provider instance is no longer current",
+            )
+            return False
+        request = ToolEnvelope(
+            protocol=TOOL_ENDPOINT_PROTOCOL,
+            message_type=f"tool.{purpose}.request",  # type: ignore[arg-type]
+            request_id=f"gateway-provider-{uuid.uuid4().hex}",
+            invocation_id=item.invocation_id,
+            attempt_id=item.attempt_id,
+            endpoint_id=item.endpoint_id,
+            endpoint_instance_id=item.endpoint_instance_id,
+            operation=item.operation,
+            payload={},
+        )
+        reserve_count = 2 if caller_response_reserved else 1
+        self._reserve_outbound_slots_locked(reserve_count)
+        try:
+            self._queue_action_exchange_locked(
+                key,
+                request,
+                registration.route,
+                purpose=purpose,
+                deadline=now + self.config.invoke_timeout_ms / 1_000,
+                logical_request=logical_request,
+                caller_response_reserved=caller_response_reserved,
+            )
+        except BaseException:
+            self._release_outbound_slots_locked(reserve_count)
+            raise
+        return True
+
+    def _queue_action_exchange_locked(
+        self,
+        execution_key: ActionKey,
+        request: ToolEnvelope,
+        route: ToolProviderRouteIdentity,
+        *,
+        purpose: str,
+        deadline: float,
+        logical_request: ToolEnvelope | None = None,
+        caller_response_reserved: bool = False,
+    ) -> None:
+        key = self._correlation_key(request)
+        if len(self._action_exchanges) >= self._outbound_capacity:
+            raise ToolGatewayMailboxFull(
+                "Action exchange capacity is exhausted"
+            )
+        if key in self._action_exchanges:
+            raise ValueError("Action provider correlation identity is already pending")
+        self._action_exchanges[key] = _ActionExchange(
+            execution_key=execution_key,
+            provider_request=request,
+            route=route,
+            provider_key=key,
+            purpose=purpose,
+            deadline=deadline,
+            logical_request=logical_request,
+            caller_response_reserved=caller_response_reserved,
+        )
+        self._append_reserved_outbound_locked(
+            ToolOutboundMessage(
+                output_id=route.output_id,
+                envelope=request,
+                kind="provider.action_request",
+                pending_key=key,
+            )
+        )
+
     def handle_input(
         self,
         input_id: str,
@@ -400,6 +796,30 @@ class ToolGatewayService:
         )
         with self._lock:
             route = self._routes_by_input_id.get(input_id)
+            if route is not None and envelope.message_type == "tool.event":
+                self._handle_action_event_locked(route, envelope)
+                return
+            if route is not None and envelope.message_type == "endpoint.status":
+                self._handle_endpoint_status_locked(
+                    route, envelope, observed_at=receive_observation
+                )
+                return
+            if (
+                route is not None
+                and envelope.message_type
+                in (
+                    "tool.invoke.response",
+                    "tool.status.response",
+                    "tool.result.response",
+                    "tool.control.response",
+                    "tool.error",
+                )
+                and self._correlation_key(envelope) in self._action_exchanges
+            ):
+                self._handle_action_response_locked(
+                    route, envelope, processed_at=process_observation
+                )
+                return
             if route is not None and envelope.message_type in (
                 "tool.invoke.response",
                 "tool.error",
@@ -420,10 +840,22 @@ class ToolGatewayService:
                 )
                 return
             if input_id == self.config.request_input_id:
-                self._handle_caller_invoke_locked(
-                    envelope,
-                    processed_at=process_observation,
-                )
+                if envelope.message_type == "tool.invoke.request":
+                    self._handle_caller_invoke_locked(
+                        envelope,
+                        processed_at=process_observation,
+                    )
+                elif envelope.message_type in (
+                    "tool.status.request",
+                    "tool.result.request",
+                    "tool.control.request",
+                ):
+                    self._handle_caller_action_request_locked(envelope)
+                else:
+                    raise ValueError(
+                        "public Tool input accepts "
+                        "invoke/status/result/control requests"
+                    )
                 return
             raise ValueError(f"unconfigured Tool input: {input_id!r}")
 
@@ -477,9 +909,26 @@ class ToolGatewayService:
                 processed_at=processed_at,
             )
             return
+        if envelope.message_type in (
+            "tool.status.response",
+            "tool.result.response",
+            "tool.control.response",
+        ):
+            self._handle_action_response_locked(
+                route, envelope, processed_at=processed_at
+            )
+            return
+        if envelope.message_type == "tool.event":
+            self._handle_action_event_locked(route, envelope)
+            return
+        if envelope.message_type == "endpoint.status":
+            self._handle_endpoint_status_locked(
+                route, envelope, observed_at=received_at
+            )
+            return
         raise ValueError(
             "provider input accepts only endpoint.register, endpoint.unregister, "
-            "tool.invoke.response, or tool.error"
+            "endpoint.status, Tool responses/events, or tool.error"
         )
 
     def _handle_caller_invoke_locked(
@@ -502,11 +951,344 @@ class ToolGatewayService:
             remaining_ms = context.deadline_ms - int(time.time() * 1_000)
             absolute_deadline = processed_at + remaining_ms / 1_000
             deadline = min(deadline, absolute_deadline)
+        expired = self._directory.expire(processed_at)
+        self._finish_unclaimed_for_removed_locked(
+            expired, observed_at=processed_at
+        )
+        try:
+            registration = self._directory.resolve(
+                context.endpoint_id, context.operation, now=processed_at
+            )
+        except ToolOperationNotFoundError:
+            registration = None
+        operation_descriptor = (
+            None
+            if registration is None
+            else next(
+                item
+                for item in registration.descriptor.operations
+                if item.name == context.operation
+            )
+        )
+        if (
+            operation_descriptor is not None
+            and operation_descriptor.semantics == "action"
+        ):
+            self._admit_dora_action_locked(
+                request, context, registration, processed_at=processed_at
+            )
+            return
         _ = self._admit_invoke_locked(
             request,
             processed_at=processed_at,
             deadline=deadline,
             future=None,
+        )
+
+    def _admit_dora_action_locked(
+        self,
+        request: ToolEnvelope,
+        context: ToolContext,
+        registration: RegisteredEndpoint,
+        *,
+        processed_at: float,
+    ) -> None:
+        # Reserve the caller terminal slot first, so every expected rejection can
+        # be returned even when no provider-request slot remains.
+        self._reserve_outbound_slots_locked()
+        provider_reserved = False
+        invocation_created = False
+        try:
+            spec = self.catalog.get(context.tool_id)
+            if spec is None:
+                raise KeyError(f"ToolSpec {context.tool_id!r} is not configured")
+            if (
+                spec.implementation_id != context.implementation_id
+                or spec.endpoint_id != context.endpoint_id
+                or spec.operation != context.operation
+                or spec.semantics != "action"
+            ):
+                raise ValueError(
+                    "Dora Action context does not exactly match its configured ToolSpec"
+                )
+            self.catalog.validate_binding(spec, registration)
+            provider_request = make_invoke_request_envelope(
+                ToolRequest(invoke_request_from_envelope(request)[0].arguments),
+                context,
+                request_id=f"gateway-provider-{uuid.uuid4().hex}",
+                endpoint_instance_id=registration.endpoint_instance_id,
+            )
+            invocation = ActionInvocation(
+                invocation_id=context.invocation_id,
+                attempt_id=context.attempt_id,
+                tool_id=context.tool_id,
+                implementation_id=context.implementation_id,
+                endpoint_id=context.endpoint_id,
+                endpoint_instance_id=registration.endpoint_instance_id,
+                operation=context.operation,
+                caller_id=context.caller_id,
+                deadline_ms=context.deadline_ms,
+                created_at=time.time(),
+            )
+            operation_descriptor = next(
+                item
+                for item in registration.descriptor.operations
+                if item.name == context.operation
+            )
+            self.action_invocations.create(
+                invocation,
+                now=processed_at,
+                operation_capacity=operation_descriptor.max_concurrency,
+            )
+            invocation_created = True
+            self._dora_action_event_cursors[invocation.key] = -1
+            self._reserve_outbound_slots_locked()
+            provider_reserved = True
+            self._queue_action_exchange_locked(
+                invocation.key,
+                provider_request,
+                registration.route,
+                purpose="invoke",
+                deadline=processed_at + self.config.invoke_timeout_ms / 1_000,
+                logical_request=request,
+                caller_response_reserved=True,
+            )
+            provider_reserved = False
+        except (
+            KeyError,
+            ValueError,
+            ActionInvocationCapacityError,
+            ToolGatewayUnavailable,
+        ) as error:
+            if provider_reserved:
+                self._release_outbound_slots_locked()
+            key = (context.invocation_id, context.attempt_id)
+            if invocation_created:
+                self.action_invocations.discard(key)
+                self._dora_action_event_cursors.pop(key, None)
+            tool_error = self._tool_error(
+                (
+                    "FORGE_TOOL_GATEWAY_BUSY"
+                    if isinstance(
+                        error,
+                        (ActionInvocationCapacityError, ToolGatewayMailboxFull),
+                    )
+                    else "FORGE_TOOL_ACTION_ADMISSION_REJECTED"
+                ),
+                str(error),
+                retryable=isinstance(
+                    error, (ActionInvocationCapacityError, ToolGatewayUnavailable)
+                ),
+            )
+            self._append_reserved_outbound_locked(
+                ToolOutboundMessage(
+                    output_id=self.config.response_output_id,
+                    envelope=_logical_error_response(tool_error, request),
+                    kind="caller.action_response",
+                )
+            )
+        except BaseException:
+            if provider_reserved:
+                self._release_outbound_slots_locked()
+            self._release_outbound_slots_locked()
+            key = (context.invocation_id, context.attempt_id)
+            if invocation_created:
+                self.action_invocations.discard(key)
+                self._dora_action_event_cursors.pop(key, None)
+            raise
+
+    def _handle_caller_action_request_locked(self, request: ToolEnvelope) -> None:
+        if request.endpoint_instance_id is not None:
+            raise ValueError("public Tool requests must omit endpoint_instance_id")
+        validate_message_envelope(request)
+        assert request.invocation_id is not None
+        assert request.attempt_id is not None
+        now = time.monotonic()
+        key = (request.invocation_id, request.attempt_id)
+        item = self.action_invocations.get(key, now=now)
+        if item is None:
+            self._respond_logical_action_error_locked(
+                request,
+                self._tool_error(
+                    "FORGE_TOOL_ACTION_NOT_FOUND",
+                    "Action ToolExecutionKey is not retained",
+                ),
+            )
+            return
+        if (
+            request.endpoint_id != item.endpoint_id
+            or request.operation != item.operation
+        ):
+            self._respond_logical_action_error_locked(
+                request,
+                self._tool_error(
+                    "FORGE_TOOL_REQUEST_CONFLICT",
+                    "public request does not match the retained Action",
+                ),
+            )
+            return
+        if request.message_type in ("tool.status.request", "tool.result.request"):
+            purpose = (
+                "status" if request.message_type == "tool.status.request" else "result"
+            )
+            if any(
+                exchange.execution_key == key and exchange.purpose == purpose
+                for exchange in self._action_exchanges.values()
+            ):
+                self._respond_logical_action_error_locked(
+                    request,
+                    self._tool_error(
+                        "FORGE_TOOL_GATEWAY_BUSY",
+                        f"an Action {purpose} lookup is already pending",
+                        retryable=True,
+                    ),
+                )
+                return
+            try:
+                queued = self._refresh_action_key_locked(
+                    key,
+                    purpose,
+                    now=now,
+                    logical_request=request,
+                    caller_response_reserved=True,
+                )
+            except (RuntimeError, ValueError) as error:
+                self._respond_logical_action_error_locked(
+                    request,
+                    self._tool_error(
+                        "FORGE_TOOL_GATEWAY_UNAVAILABLE",
+                        str(error),
+                        retryable=True,
+                    ),
+                )
+                return
+            if not queued:
+                self._respond_logical_action_error_locked(
+                    request,
+                    self._tool_error(
+                        "FORGE_TOOL_EXECUTION_OUTCOME_UNKNOWN",
+                        "pinned provider instance is no longer current",
+                    ),
+                )
+            return
+
+        command = request.payload.get("command")
+        expired = self._directory.expire(now)
+        self._finish_unclaimed_for_removed_locked(expired, observed_at=now)
+        registration = self._directory.resolve(
+            item.endpoint_id, item.operation, now=now
+        )
+        if (
+            registration is None
+            or registration.endpoint_instance_id != item.endpoint_instance_id
+        ):
+            self.action_invocations.mark_instance_ambiguous(
+                item.endpoint_id,
+                item.endpoint_instance_id,
+                now=now,
+                reason="pinned provider instance is no longer current",
+            )
+            self._respond_logical_action_error_locked(
+                request,
+                self._tool_error(
+                    "FORGE_TOOL_EXECUTION_OUTCOME_UNKNOWN",
+                    "pinned provider instance is no longer current",
+                ),
+            )
+            return
+        operation = next(
+            entry
+            for entry in registration.descriptor.operations
+            if entry.name == item.operation
+        )
+        if (command == "cancel" and not operation.cancellable) or (
+            command == "stop" and not operation.stoppable
+        ):
+            self._respond_logical_action_error_locked(
+                request,
+                self._tool_error(
+                    "FORGE_TOOL_CONTROL_UNSUPPORTED",
+                    f"operation does not support {command}",
+                ),
+            )
+            return
+        purpose = f"control:{command}"
+        if any(
+            exchange.execution_key == key and exchange.purpose == purpose
+            for exchange in self._action_exchanges.values()
+        ):
+            self._respond_logical_action_error_locked(
+                request,
+                self._tool_error(
+                    "FORGE_TOOL_GATEWAY_BUSY",
+                    f"an Action {command} request is already pending",
+                    retryable=True,
+                ),
+            )
+            return
+        provider_request = ToolEnvelope(
+            protocol=request.protocol,
+            message_type=request.message_type,
+            request_id=f"gateway-provider-{uuid.uuid4().hex}",
+            invocation_id=item.invocation_id,
+            attempt_id=item.attempt_id,
+            endpoint_id=item.endpoint_id,
+            endpoint_instance_id=item.endpoint_instance_id,
+            operation=item.operation,
+            payload=dict(request.payload),
+        )
+        self._reserve_outbound_slots_locked()
+        provider_reserved = False
+        try:
+            self._reserve_outbound_slots_locked()
+            provider_reserved = True
+            if command == "cancel":
+                self.action_invocations.set_cancel_status(key, "requested")
+            self._queue_action_exchange_locked(
+                key,
+                provider_request,
+                registration.route,
+                purpose=purpose,
+                deadline=now + self.config.invoke_timeout_ms / 1_000,
+                logical_request=request,
+                caller_response_reserved=True,
+            )
+            provider_reserved = False
+        except (RuntimeError, ValueError) as error:
+            if provider_reserved:
+                self._release_outbound_slots_locked()
+            if command == "cancel":
+                self.action_invocations.set_cancel_status(key, "transport_error")
+            self._append_reserved_outbound_locked(
+                ToolOutboundMessage(
+                    output_id=self.config.response_output_id,
+                    envelope=_logical_error_response(
+                        self._tool_error(
+                            "FORGE_TOOL_GATEWAY_BUSY",
+                            str(error),
+                            retryable=True,
+                        ),
+                        request,
+                    ),
+                    kind="caller.action_response",
+                )
+            )
+        except BaseException:
+            if provider_reserved:
+                self._release_outbound_slots_locked()
+            self._release_outbound_slots_locked()
+            raise
+
+    def _respond_logical_action_error_locked(
+        self, request: ToolEnvelope, error: ToolError
+    ) -> None:
+        self._reserve_outbound_slots_locked()
+        self._append_reserved_outbound_locked(
+            ToolOutboundMessage(
+                output_id=self.config.response_output_id,
+                envelope=_logical_error_response(error, request),
+                kind="caller.action_response",
+            )
         )
 
     def submit_http_invoke(
@@ -784,6 +1566,296 @@ class ToolGatewayService:
         )
 
     @staticmethod
+    def _phase_for_result(result: Any) -> str:
+        return {
+            "succeeded": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "stopped": "stopped",
+            "unknown": "unknown",
+        }[result.status]
+
+    def _handle_action_response_locked(
+        self,
+        route: ToolProviderRouteIdentity,
+        response: ToolEnvelope,
+        *,
+        processed_at: float,
+    ) -> bool:
+        validate_message_envelope(response)
+        key = self._correlation_key(response)
+        exchange = self._action_exchanges.get(key)
+        if exchange is None:
+            return False
+        if exchange.route != route:
+            raise ValueError("provider response arrived on the wrong configured route")
+        validate_response_correlation(exchange.provider_request, response)
+        if processed_at >= exchange.deadline:
+            return self._finish_action_exchange_error_locked(
+                exchange,
+                self._tool_error(
+                    "FORGE_TOOL_EXCHANGE_TIMEOUT",
+                    f"Action {exchange.purpose} exchange timed out",
+                    retryable=exchange.purpose != "invoke",
+                ),
+                observed_at=processed_at,
+                execution_ambiguous=(
+                    exchange.purpose == "invoke" and exchange.dispatch_claimed
+                ),
+            )
+        del self._action_exchanges[key]
+        execution_key = exchange.execution_key
+        if response.message_type == "tool.error":
+            error = error_from_payload(response.payload)
+            if exchange.purpose == "invoke":
+                result = ToolResult(status="unknown", outputs={}, error=error)
+                self.action_invocations.set_phase(
+                    execution_key,
+                    "unknown",
+                    now=processed_at,
+                    result=result,
+                    error=error,
+                    release_concurrency=False,
+                )
+            elif exchange.purpose.startswith("control:"):
+                command = exchange.purpose.partition(":")[2]
+                if command == "cancel":
+                    self.action_invocations.set_cancel_status(
+                        execution_key, "transport_error"
+                    )
+                self.action_invocations.set_observation_error(execution_key, error)
+            else:
+                self.action_invocations.set_observation_error(execution_key, error)
+        elif response.message_type == "tool.invoke.response":
+            outcome = invoke_response_from_payload(response.payload)
+            if isinstance(outcome, ToolAccepted):
+                self.action_invocations.establish_accepted(
+                    execution_key, now=processed_at
+                )
+            elif isinstance(outcome, ToolError):
+                result = ToolResult(status="failed", outputs={}, error=outcome)
+                self.action_invocations.set_phase(
+                    execution_key,
+                    "failed",
+                    now=processed_at,
+                    result=result,
+                    error=outcome,
+                )
+            else:
+                self.action_invocations.set_phase(
+                    execution_key,
+                    self._phase_for_result(outcome),  # type: ignore[arg-type]
+                    now=processed_at,
+                    result=outcome,
+                    error=outcome.error,
+                )
+        elif response.message_type == "tool.status.response":
+            status = status_response_from_payload(response.payload)
+            if status.phase in TERMINAL_PHASES:
+                self.action_invocations.set_terminal_status_hint(
+                    execution_key,
+                    status.phase,  # type: ignore[arg-type]
+                    error=status.error,
+                )
+                item = self.action_invocations.get(
+                    execution_key, now=processed_at
+                )
+                if item is not None and item.result is None:
+                    try:
+                        self._refresh_action_key_locked(
+                            execution_key, "result", now=processed_at
+                        )
+                    except RuntimeError as error:
+                        self.action_invocations.set_observation_error(
+                            execution_key,
+                            self._tool_error(
+                                "FORGE_TOOL_RESULT_LOOKUP_UNAVAILABLE",
+                                str(error),
+                                retryable=True,
+                            ),
+                        )
+            else:
+                self.action_invocations.set_phase(
+                    execution_key,
+                    status.phase,  # type: ignore[arg-type]
+                    now=processed_at,
+                    error=status.error,
+                )
+        elif response.message_type == "tool.result.response":
+            lookup = result_response_from_payload(response.payload)
+            if lookup.status == "available":
+                assert lookup.result is not None
+                self.action_invocations.set_phase(
+                    execution_key,
+                    self._phase_for_result(lookup.result),  # type: ignore[arg-type]
+                    now=processed_at,
+                    result=lookup.result,
+                    error=lookup.result.error,
+                )
+            elif lookup.status == "not_found":
+                error = self._tool_error(
+                    "FORGE_TOOL_EXECUTION_OUTCOME_UNKNOWN",
+                    "provider no longer retains the Action result",
+                )
+                item = self.action_invocations.get(execution_key, now=processed_at)
+                release = bool(
+                    item is not None and item.terminal_status_hint in TERMINAL_PHASES
+                )
+                self.action_invocations.set_phase(
+                    execution_key,
+                    "unknown",
+                    now=processed_at,
+                    result=ToolResult(status="unknown", outputs={}, error=error),
+                    error=error,
+                    release_concurrency=release,
+                )
+        elif response.message_type == "tool.control.response":
+            control = control_response_from_payload(response.payload)
+            if control.command == "cancel":
+                self.action_invocations.set_cancel_status(
+                    execution_key, control.status
+                )
+
+        if exchange.logical_request is not None:
+            if not exchange.caller_response_reserved:
+                raise RuntimeError("Dora Action response has no reserved mailbox slot")
+            self._append_reserved_outbound_locked(
+                ToolOutboundMessage(
+                    output_id=self.config.response_output_id,
+                    envelope=_logical_provider_response(
+                        response, exchange.logical_request
+                    ),
+                    kind="caller.action_response",
+                )
+            )
+            exchange.caller_response_reserved = False
+        self._queue_dora_events_locked(execution_key, now=processed_at)
+        return True
+
+    def _queue_dora_events_locked(
+        self, execution_key: ActionKey, *, now: float
+    ) -> None:
+        cursor = self._dora_action_event_cursors.get(execution_key)
+        if cursor is None:
+            return
+        events = self.action_invocations.events_after(execution_key, cursor, now=now)
+        if events is None:
+            self._dora_action_event_cursors.pop(execution_key, None)
+            return
+        item = self.action_invocations.get(execution_key, now=now)
+        if item is None:
+            return
+        for event in events:
+            self._reserve_outbound_slots_locked()
+            envelope = ToolEnvelope(
+                protocol=TOOL_ENDPOINT_PROTOCOL,
+                message_type="tool.event",
+                request_id=None,
+                invocation_id=item.invocation_id,
+                attempt_id=item.attempt_id,
+                endpoint_id=item.endpoint_id,
+                endpoint_instance_id=None,
+                operation=item.operation,
+                sequence=event.sequence,
+                payload={"type": event.type, "data": dict(event.data)},
+            )
+            self._append_reserved_outbound_locked(
+                ToolOutboundMessage(
+                    output_id=self.config.response_output_id,
+                    envelope=envelope,
+                    kind="caller.action_response",
+                )
+            )
+            self._dora_action_event_cursors[execution_key] = event.sequence
+
+    def _handle_action_event_locked(
+        self, route: ToolProviderRouteIdentity, envelope: ToolEnvelope
+    ) -> None:
+        validate_message_envelope(envelope)
+        assert envelope.invocation_id is not None
+        assert envelope.attempt_id is not None
+        execution_key = (envelope.invocation_id, envelope.attempt_id)
+        item = self.action_invocations.get(execution_key, now=time.monotonic())
+        if item is None:
+            return
+        if (
+            route.endpoint_id != item.endpoint_id
+            or envelope.endpoint_instance_id != item.endpoint_instance_id
+            or envelope.attempt_id != item.attempt_id
+            or envelope.operation != item.operation
+        ):
+            raise ValueError("Tool event does not match the pinned Action attempt")
+        assert envelope.sequence is not None
+        event = event_from_payload(envelope.payload)
+        appended = self.action_invocations.append_event(
+            execution_key,
+            event,
+            provider_sequence=envelope.sequence,
+        )
+        if appended:
+            self._queue_dora_events_locked(execution_key, now=time.monotonic())
+            if event.type in (
+                "executor_completed",
+                "executor_failed",
+                "cancelled",
+                "stopped",
+            ):
+                try:
+                    self._refresh_action_key_locked(
+                        execution_key, "result", now=time.monotonic()
+                    )
+                except RuntimeError as error:
+                    self.action_invocations.set_observation_error(
+                        execution_key,
+                        self._tool_error(
+                            "FORGE_TOOL_RESULT_LOOKUP_UNAVAILABLE",
+                            str(error),
+                            retryable=True,
+                        ),
+                    )
+
+    def _handle_endpoint_status_locked(
+        self,
+        route: ToolProviderRouteIdentity,
+        envelope: ToolEnvelope,
+        *,
+        observed_at: float,
+    ) -> None:
+        validate_message_envelope(envelope)
+        status = endpoint_status_from_envelope(envelope)
+        expired = self._directory.expire(observed_at)
+        self._finish_unclaimed_for_removed_locked(expired, observed_at=observed_at)
+        current = next(
+            (
+                registration
+                for registration in self._directory.registrations(now=observed_at)
+                if registration.endpoint_id == route.endpoint_id
+            ),
+            None,
+        )
+        if current is None:
+            return
+        if (
+            envelope.endpoint_id != route.endpoint_id
+            or envelope.endpoint_instance_id != current.endpoint_instance_id
+        ):
+            raise ValueError(
+                "endpoint.status is not from the current provider instance"
+            )
+        self._endpoint_statuses[(route.endpoint_id, current.endpoint_instance_id)] = {
+            "state": status.state,
+            "active_invocations": status.active_invocations,
+            "details": dict(status.details),
+        }
+
+    def endpoint_readiness(
+        self, endpoint_id: str, endpoint_instance_id: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            value = self._endpoint_statuses.get((endpoint_id, endpoint_instance_id))
+            return None if value is None else dict(value)
+
+    @staticmethod
     def _tool_error(
         code: str,
         message: str,
@@ -844,6 +1916,41 @@ class ToolGatewayService:
             )
             for registration in removed
         }
+        action_exchanges = tuple(
+            exchange
+            for exchange in self._action_exchanges.values()
+            if (
+                exchange.provider_request.endpoint_id,
+                exchange.provider_request.endpoint_instance_id,
+                exchange.route,
+            )
+            in removed_routes
+        )
+        for exchange in action_exchanges:
+            error = self._tool_error(
+                "FORGE_TOOL_ENDPOINT_UNAVAILABLE",
+                "pinned provider instance became unavailable",
+                retryable=not exchange.dispatch_claimed,
+            )
+            self._finish_action_exchange_error_locked(
+                exchange,
+                error,
+                observed_at=observed_at,
+                execution_ambiguous=exchange.dispatch_claimed,
+            )
+        for registration in removed:
+            self._endpoint_statuses.pop(
+                (registration.endpoint_id, registration.endpoint_instance_id), None
+            )
+            self.action_invocations.mark_instance_ambiguous(
+                registration.endpoint_id,
+                registration.endpoint_instance_id,
+                now=observed_at,
+                reason=(
+                    "pinned provider lease expired or provider instance restarted; "
+                    "the Action outcome is ambiguous"
+                ),
+            )
         affected = tuple(
             pending
             for pending in self._pending_by_provider_key.values()
@@ -880,6 +1987,64 @@ class ToolGatewayService:
                 completed += 1
                 timed_out += int(deadline_elapsed)
         return completed, timed_out
+
+    def _finish_action_exchange_error_locked(
+        self,
+        exchange: _ActionExchange,
+        error: ToolError,
+        *,
+        observed_at: float,
+        execution_ambiguous: bool,
+    ) -> bool:
+        current = self._action_exchanges.get(exchange.provider_key)
+        if current is not exchange:
+            return False
+        del self._action_exchanges[exchange.provider_key]
+        key = exchange.execution_key
+        if exchange.purpose == "invoke":
+            if execution_ambiguous:
+                result_error = self._tool_error(
+                    "FORGE_TOOL_EXECUTION_OUTCOME_UNKNOWN",
+                    error.message,
+                    retryable=False,
+                )
+                self.action_invocations.set_phase(
+                    key,
+                    "unknown",
+                    now=observed_at,
+                    result=ToolResult(
+                        status="unknown", outputs={}, error=result_error
+                    ),
+                    error=result_error,
+                    release_concurrency=False,
+                )
+            else:
+                self.action_invocations.set_phase(
+                    key,
+                    "failed",
+                    now=observed_at,
+                    result=ToolResult(status="failed", outputs={}, error=error),
+                    error=error,
+                )
+        elif exchange.purpose.startswith("control:"):
+            if exchange.purpose == "control:cancel":
+                self.action_invocations.set_cancel_status(key, "transport_error")
+            self.action_invocations.set_observation_error(key, error)
+        else:
+            self.action_invocations.set_observation_error(key, error)
+        if exchange.caller_response_reserved:
+            assert exchange.logical_request is not None
+            self._append_reserved_outbound_locked(
+                ToolOutboundMessage(
+                    output_id=self.config.response_output_id,
+                    envelope=_logical_error_response(
+                        error, exchange.logical_request
+                    ),
+                    kind="caller.action_response",
+                )
+            )
+            exchange.caller_response_reserved = False
+        return True
 
     def _remove_pending_locked(self, pending: _PendingInvocation) -> None:
         current = self._pending_by_provider_key.get(pending.provider_key)
@@ -954,6 +2119,14 @@ class ToolGatewayService:
                     ):
                         continue
                     pending.dispatch_claimed = True
+                elif message.kind == "provider.action_request":
+                    pending_key = message.pending_key
+                    if pending_key is None:
+                        continue
+                    exchange = self._action_exchanges.get(pending_key)
+                    if exchange is None or exchange.dispatch_claimed:
+                        continue
+                    exchange.dispatch_claimed = True
                 return message
             return None
 
@@ -1005,6 +2178,32 @@ class ToolGatewayService:
         now: float | None = None,
     ) -> bool:
         """Fail an invocation whose one-shot provider dispatch did not succeed."""
+        if (
+            message.kind == "provider.action_request"
+            and message.pending_key is not None
+        ):
+            with self._lock:
+                exchange = self._action_exchanges.get(message.pending_key)
+                if exchange is None:
+                    return False
+                tool_error = self._tool_error(
+                    "FORGE_TOOL_TRANSPORT_UNAVAILABLE",
+                    f"provider request dispatch failed: {error}",
+                    retryable=True,
+                )
+                return self._finish_action_exchange_error_locked(
+                    exchange,
+                    tool_error,
+                    observed_at=(
+                        time.monotonic()
+                        if now is None
+                        else self._validate_now(now)
+                    ),
+                    # send_output may have crossed the transport boundary.
+                    execution_ambiguous=(
+                        exchange.purpose == "invoke" and exchange.dispatch_claimed
+                    ),
+                )
         if message.kind != "provider.invoke_request" or message.pending_key is None:
             return False
         explicit_observation = None if now is None else self._validate_now(now)
@@ -1049,7 +2248,31 @@ class ToolGatewayService:
                 for pending in self._pending_by_provider_key.values()
                 if pending.deadline <= observation
             )
+            action_timeouts = tuple(
+                exchange
+                for exchange in self._action_exchanges.values()
+                if exchange.deadline <= observation
+            )
             completed = transition_timeouts
+            for exchange in action_timeouts:
+                error = self._tool_error(
+                    "FORGE_TOOL_EXCHANGE_TIMEOUT",
+                    f"Action {exchange.purpose} exchange timed out",
+                    retryable=exchange.purpose != "invoke",
+                )
+                self._finish_action_exchange_error_locked(
+                    exchange,
+                    error,
+                    observed_at=observation,
+                    execution_ambiguous=(
+                        exchange.purpose == "invoke"
+                        and exchange.dispatch_claimed
+                    ),
+                )
+            self.action_invocations.mark_deadlines_ambiguous(
+                now=observation,
+                epoch_ms=int(time.time() * 1_000),
+            )
             for pending in timed_out:
                 response = _logical_error_response(
                     self._tool_error(
@@ -1079,6 +2302,20 @@ class ToolGatewayService:
                 else explicit_observation
             )
             self._accepting = False
+            for exchange in tuple(self._action_exchanges.values()):
+                self._finish_action_exchange_error_locked(
+                    exchange,
+                    self._tool_error(
+                        "FORGE_TOOL_GATEWAY_UNAVAILABLE",
+                        "Tool Gateway is closing",
+                        retryable=True,
+                    ),
+                    observed_at=observation,
+                    execution_ambiguous=(
+                        exchange.purpose == "invoke"
+                        and exchange.dispatch_claimed
+                    ),
+                )
             pending_invocations = tuple(self._pending_by_provider_key.values())
             for pending in pending_invocations:
                 response = _logical_error_response(

@@ -65,11 +65,11 @@ Agent-facing reset 入口，内部复用 runtime `reset_scene` 命令。
 
 ## Tool API
 
-Gateway 是 caller-visible 的 Tool discovery/routing authority，仅支持 Query operation。
+Gateway 是 caller-visible 的 Tool discovery/routing authority。现有 Query 同步行为保持不变；配置绑定的 Action 使用独立 invocation resource。
 
 ### `GET /tools`
 
-列出当前 lease 有效的 endpoint descriptor，并返回 process-global Directory `revision`。`endpoint_instance_id` 是 Gateway 私有路由状态；public discovery 不暴露 instance、provider Dora route 或内部 monotonic `expires_at`。已过期 registration 会在读取时移除。
+配置了 `tools.specs` 时列出 ToolSpec 及其当前 descriptor binding 可用性；未配置时保持兼容行为，列出当前 lease 有效的 endpoint descriptor。响应不暴露 pinned instance、Dora route 或 monotonic lease 时间。
 
 ```json
 {
@@ -122,7 +122,21 @@ Gateway 是 caller-visible 的 Tool discovery/routing authority，仅支持 Quer
 - `503`：Gateway disabled/closing/busy、endpoint 当前无 active instance、provider transport 失败或 outbound mailbox 已满；
 - `504`：pending invocation 超过 deadline。
 
-HTTP 输出不包含 provider-pinned `endpoint_instance_id`。HTTP handler 使用独立 monotonic hard deadline wait；即使 Dora lifecycle sweep 停止，也会通过 service cancellation path 结束 pending invocation。provider response 在 deadline 前被 reader 收到但仍排队时不会延长 HTTP deadline。provider response、transport output failure、caller cancellation、Gateway close 等异步 terminal completion 在同一 service lock 下按 monotonic observation 统一仲裁：`now >= deadline` 时返回 `FORGE_TOOL_INVOKE_TIMEOUT`/`504`，deadline 前已线性化的原结果保持不变。pending 已结束后到达的合法 provider response/error 是预期的 late/duplicate response，会被静默丢弃。Gateway 不执行 retry、dedup、action 或 session 调度。
+HTTP 输出不包含 provider-pinned `endpoint_instance_id`。HTTP handler 使用独立 monotonic hard deadline wait；即使 Dora lifecycle sweep 停止，也会通过 service cancellation path 结束 pending Query。provider response 在 deadline 前被 reader 收到但仍排队时不会延长 HTTP deadline。provider response、transport output failure、caller cancellation、Gateway close 等 Query terminal completion 在同一 service lock 下按 monotonic observation 统一仲裁。Gateway 不执行 retry、dedup 或 Session 调度。
+
+如果 endpoint operation 是 Action，则必须存在 semantics 一致的 ToolSpec binding，接口立即返回 `202` invocation resource，不等待执行完成。
+
+### ToolSpec 与 Action invocation
+
+- `GET /tools/{tool_id}`：返回配置 ToolSpec。
+- `GET /tools/{tool_id}/context`：返回 ToolSpec binding、Gateway readiness、当前 `endpoint.status` 与 `RobotFrameProfile`。
+- `POST /tools/{tool_id}:invoke`：创建 Action invocation，Gateway 生成 invocation/attempt identity 并 pin 当前 endpoint instance，返回 `202`。
+- `GET /invocations/{invocation_id}`：返回 phase；非 terminal 时触发一次有界 provider status refresh。
+- `GET /invocations/{invocation_id}/result`：terminal result 返回 `200`；pending 返回 `202` 并触发一次有界 provider result refresh。
+- `POST /invocations/{invocation_id}/cancel`：发送 cancel control。`202 requested/accepted` 仅表示 control 被接纳，不表示 invocation 已 cancelled。
+- `GET /invocations/{invocation_id}/events`：SSE，支持 `Last-Event-ID`；游标早于保留窗口返回 `410`，每个 invocation 只保留配置上限内的最新事件。
+
+Action invocation store 受 `tools.invocation_capacity`、`event_capacity` 和 `retention_sec` 限制，其中 invocation capacity 是 active 与 terminal retention 的总量硬上限。内部以 `(invocation_id, attempt_id)` 关联；HTTP 自生成 invocation ID 保持单 ID resource。terminal result 在 phase/event 之前建立，provider invoke accepted 使用独立 barrier，早到事件在 accepted 前不对 caller 暴露。lease expiry、provider instance replacement/restart 或 transport 失败导致已 dispatch Action 结果不可恢复时记录 terminal `unknown`，不盲目 retry。deadline 到达不会向 provider 发送 stop/cancel；只要原 provider 仍可能执行，`unknown` 继续占用 operation concurrency，直到 instance 被隔离。cancel accepted 也不会自行改写 terminal phase。Session/PAOS/Skill Runtime 不在此链路中。
 
 ## Runtime API
 
@@ -237,13 +251,13 @@ HTTP 输出不包含 provider-pinned `endpoint_instance_id`。HTTP handler 使�
 - `policy_command_status`
 - 配置中的 `image_input_ids`
 - `tools.request_input_id`：public caller 的 logical `tool.invoke.request`
-- `tools.providers[*].input_id`：provider→Gateway 共享输入，接受 `endpoint.register`、`endpoint.unregister`、`tool.invoke.response`、`tool.error`
+- `tools.providers[*].input_id`：provider→Gateway 共享输入，接受 management、invoke/status/result/control response、`tool.event`、`tool.error`
 
 输出：
 
 - `policy_command`
-- `tools.response_output_id`：返回 public caller 的 correlated `tool.invoke.response` 或 `tool.error`
-- `tools.providers[*].output_id`：Gateway→provider 共享输出，发送 `endpoint.registry.response` 或 pinned `tool.invoke.request`
+- `tools.response_output_id`：返回 public Dora caller 的 correlated Tool response/error
+- `tools.providers[*].output_id`：Gateway→provider 共享输出，发送 registry response 或 pinned invoke/status/result/control request
 
 每条 provider config 仅包含 `endpoint_id`、`input_id`、`output_id`。Directory 不使用 source ID、source generation、tombstone 或 heartbeat。`endpoint.register` 是幂等 announce/renew；同 route 新 instance 原子替换 current。`endpoint_instance_id` 是 Gateway 私有路由状态：public caller 必须省略且 discovery/response 不暴露，Gateway resolve active registration 后只在 provider-facing invoke 上 pin instance。
 

@@ -94,9 +94,9 @@ Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形
 
 未配置 `agent.action_manifests` 时，Gateway 会加载 package 内置的 `piper/sam3.md`，无需复制资源或依赖当前工作目录。显式配置外部 manifest 时，相对路径仍按 YAML 配置文件所在目录解析。
 
-`tools.enabled: true` 时，Gateway 可以作为 Tool-only Dora 节点启动，不要求 `joint_order`。Gateway 是唯一 caller-visible discovery/routing authority：每个 provider 只配置 `endpoint_id`、provider→Gateway 的 `input_id` 和 Gateway→provider 的 `output_id`。provider 在同一输入发送 `endpoint.register`、`endpoint.unregister`、`tool.invoke.response` 或 `tool.error`，Gateway 在同一输出发送 correlated `endpoint.registry.response` 或 pinned `tool.invoke.request`。
+`tools.enabled: true` 时，Gateway 可以作为 Tool-only Dora 节点启动，不要求 `joint_order`。Gateway 是唯一 caller-visible discovery/routing authority：provider 共享输入接受 management、invoke/status/result/control response、`tool.event` 和 `tool.error`；共享输出发送 registry response 及 pinned Tool request。
 
-Directory 对每个 `endpoint_id` 维护一个带 monotonic lease 的 current instance。`endpoint.register` 同时承担 announce/renew：同 route、instance、descriptor 只续租且 revision 不变；同 route 的新 instance 原子替换 current 并增加 process-global revision。register/unregister 的 lease effect 使用 Dora reader 捕获的 `received_at`；Query admission 和 provider response deadline 则以 Gateway lifecycle 实际处理时的 `processed_at` 判定。`tools.invoke_timeout_ms` 是所有 caller timeout 的配置上限：HTTP 可省略 `timeout_ms` 或传入 `1..invoke_timeout_ms`，public Dora `ToolContext.deadline_ms` 也只能缩短、不能延长该上限。没有 heartbeat、source generation、tombstone、重试、dedup、action 或 session；仅支持 Query operation。`endpoint_instance_id` 是 Gateway 私有路由状态，不出现在 public discovery 或 caller response 中。public Dora caller 从 `tools.request_input_id` 发送 instance-less logical `tool.invoke.request`；Gateway resolve current 后只在 provider-facing request 上 pin instance，并从 `tools.response_output_id` 返回 terminal response/error。所有 Tool 输入进入同一个有界有序 FIFO；HTTP 与 Dora pending invocation 的总数不超过 service `outbound_capacity`，provider dispatch 被 claim 后仍占用 pending capacity。Dora pending invocation 在有界 outbound mailbox 中预留 terminal response slot，HTTP handler 另有独立 hard deadline wait，所有 Dora `send_output` 均由 lifecycle thread 执行。
+Directory 对每个 `endpoint_id` 维护一个带 monotonic lease 的 current instance，并允许 Query/Action descriptor。Query 同步行为保持不变。配置 `tools.specs` 后，Action 使用独立有界 invocation store：Gateway 生成 invocation/attempt、pin provider instance，并路由 invoke/status/result/control/event。terminal result 与事件按配置保留；lease expiry/provider replacement 的不确定结果记为 `unknown`。deadline 不等于 stop，cancel accepted 也不等于 cancelled。Gateway 不实现 retry、dedup、Session、PAOS 或 Skill Runtime。
 
 启动：
 
@@ -132,7 +132,10 @@ uv run python main.py --config gateway.yaml --print-capabilities
 - `POST /runtime/reset_scene`：发送 `reset_scene` runtime 命令，用于仿真场景复位；不同于 playback 的 `RESET`
 - `POST /runtime/stop`
 - `GET /tools`：列出当前 active Tool descriptor；不暴露 provider instance、route 或 monotonic lease 时间。
+- `GET /tools/{tool_id}`、`GET /tools/{tool_id}/context`：读取 ToolSpec 与 readiness/frame context。
+- `POST /tools/{tool_id}:invoke`：创建 Action invocation，返回 `202`。
 - `POST /tools/{endpoint_id}/{operation}:invoke`：调用 Query Tool，body: `{"arguments":{},"caller_id":"optional","timeout_ms":5000}`；`timeout_ms` 可省略，否则必须在 `1..tools.invoke_timeout_ms`；使用与 Dora caller 相同的 Tool Gateway service。
+- `GET /invocations/{id}`、`GET /invocations/{id}/result`、`POST /invocations/{id}/cancel`、`GET /invocations/{id}/events`：Action 状态、结果、取消和 SSE。
 
 - `POST /policy/command`：直接发送 `PolicyCommand`，body: `{"command":"...","inputs":{}}`
 - `GET /runtime/status`：返回状态快照与 readiness

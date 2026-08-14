@@ -66,13 +66,13 @@ class EndpointDirectoryMutation:
 
 
 class ToolOperationNotFoundError(LookupError):
-    """The active endpoint descriptor does not expose a requested Query operation."""
+    """The active endpoint descriptor does not expose a requested operation."""
 
     def __init__(self, endpoint_id: str, operation: str) -> None:
         self.endpoint_id = endpoint_id
         self.operation = operation
         super().__init__(
-            f"endpoint {endpoint_id!r} does not expose Query operation {operation!r}"
+            f"endpoint {endpoint_id!r} does not expose operation {operation!r}"
         )
 
 
@@ -221,7 +221,7 @@ class EndpointDirectory:
             if (
                 descriptor.endpoint_id == route.endpoint_id
                 and all(
-                    operation.semantics == "query"
+                    operation.semantics in ("query", "action")
                     for operation in descriptor.operations
                 )
                 and (
@@ -240,18 +240,21 @@ class EndpointDirectory:
                     response=self._rejected(
                         "register",
                         "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED",
-                        "the configured provider route is not authorized for this endpoint",
+                        "the configured provider route is not authorized "
+                        "for this endpoint",
                     ),
                     removed=expired,
                 )
             if any(
-                operation.semantics != "query" for operation in descriptor.operations
+                operation.semantics not in ("query", "action")
+                for operation in descriptor.operations
             ):
                 return EndpointDirectoryMutation(
                     response=self._rejected(
                         "register",
                         "FORGE_TOOL_SEMANTICS_UNSUPPORTED",
-                        "Gateway Tool providers may register Query operations only",
+                        "Gateway Tool providers may register Query or Action "
+                        "operations only",
                     ),
                     removed=expired,
                 )
@@ -354,7 +357,8 @@ class EndpointDirectory:
                     response=self._rejected(
                         "unregister",
                         "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED",
-                        "the configured provider route is not authorized for this endpoint",
+                        "the configured provider route is not authorized "
+                        "for this endpoint",
                     ),
                     removed=expired,
                 )
@@ -379,7 +383,8 @@ class EndpointDirectory:
                     response=self._rejected(
                         "unregister",
                         "FORGE_ENDPOINT_ROUTE_CONFLICT",
-                        "another configured provider route owns the current endpoint lease",
+                        "another configured provider route owns the current "
+                        "endpoint lease",
                     ),
                     removed=expired,
                 )
@@ -422,7 +427,7 @@ class EndpointDirectory:
                 ),
                 None,
             )
-            if matching_operation is None or matching_operation.semantics != "query":
+            if matching_operation is None:
                 raise ToolOperationNotFoundError(endpoint, operation_name)
             return current
 

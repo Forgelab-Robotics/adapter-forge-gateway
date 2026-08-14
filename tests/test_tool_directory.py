@@ -3,17 +3,18 @@ from __future__ import annotations
 from typing import Literal, cast
 
 import pytest
-from forge_gateway.domain.tool_directory import (
-    EndpointDirectory,
-    ToolOperationNotFoundError,
-    ToolProviderRouteIdentity,
-)
 from forge_tool import (
     TOOL_ENDPOINT_PROTOCOL,
     ToolEndpointDescriptor,
     ToolOperationDescriptor,
     make_registration_envelope,
     make_unregister_envelope,
+)
+
+from forge_gateway.domain.tool_directory import (
+    EndpointDirectory,
+    ToolOperationNotFoundError,
+    ToolProviderRouteIdentity,
 )
 
 
@@ -30,7 +31,7 @@ def descriptor(
             ToolOperationDescriptor(
                 name=operation,
                 semantics=semantics,
-                status_supported=semantics == "action",
+                status_supported=semantics != "query",
                 max_concurrency=1,
             ),
         ),
@@ -168,7 +169,7 @@ def test_different_route_cannot_replace_current() -> None:
     assert directory.revision == 1
 
 
-def test_register_rejects_route_endpoint_mismatch_and_non_query_descriptor() -> None:
+def test_register_rejects_route_mismatch_and_session_but_accepts_action() -> None:
     directory = EndpointDirectory()
 
     unauthorized = directory.register(
@@ -176,22 +177,34 @@ def test_register_rejects_route_endpoint_mismatch_and_non_query_descriptor() -> 
         route(),
         now=1.0,
     )
-    unsupported = directory.register(
+    action = directory.register(
         registration(semantics="action", request_id="register-action"),
         route(),
         now=2.0,
+    )
+    unsupported = directory.register(
+        registration(
+            semantics="session",
+            instance_id="instance-session",
+            request_id="register-session",
+        ),
+        route(),
+        now=3.0,
     )
 
     assert unauthorized.status == "rejected"
     assert unauthorized.error is not None
     assert unauthorized.error.code == "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED"
+    assert action.status == "accepted"
     assert unsupported.status == "rejected"
     assert unsupported.error is not None
     assert unsupported.error.code == "FORGE_TOOL_SEMANTICS_UNSUPPORTED"
-    assert directory.revision == 0
+    assert directory.revision == 1
 
 
-def test_matching_unregister_removes_and_absent_unregister_is_effect_idempotent() -> None:
+def test_matching_unregister_removes_and_absent_unregister_is_effect_idempotent() -> (
+    None
+):
     directory = EndpointDirectory()
     directory.register(registration(), route(), now=1.0)
 
