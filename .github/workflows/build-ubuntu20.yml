@@ -49,65 +49,13 @@ jobs:
       - name: Build with PyInstaller
         run: ./scripts/build_pyinstaller.sh
 
-      - name: Verify and package PAOS Node Bundle
+      - name: Verify and package binary
         run: |
+          test "$(git describe --tags --exact-match)" = "v${RELEASE_VERSION}"
           test "$(./dist/gateway --version)" = "forge-gateway ${RELEASE_VERSION}"
           file ./dist/gateway
           ldd --version | sed -n '1p'
-          uv run --no-project --python 3.12 python - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-
-          root = Path("dist")
-          binary = root / "gateway"
-          version = os.environ["RELEASE_VERSION"]
-
-          def file_record(path: Path) -> dict[str, object]:
-              data = path.read_bytes()
-              return {
-                  "path": path.name,
-                  "size": len(data),
-                  "sha256": hashlib.sha256(data).hexdigest(),
-              }
-
-          node_manifest = {
-              "manifest_version": 1,
-              "node_id": "gateway",
-              "artifact_id": f"gateway-{version}-linux-x86_64",
-              "version": version,
-              "platform": "linux",
-              "arch": "x86_64",
-              "entrypoints": {"gateway": "gateway"},
-              "files": [file_record(binary)],
-          }
-          canonical = json.dumps(
-              node_manifest,
-              ensure_ascii=False,
-              separators=(",", ":"),
-              sort_keys=True,
-          ).encode()
-          node_manifest["digest"] = hashlib.sha256(canonical).hexdigest()
-          manifest_path = root / "node-manifest.json"
-          manifest_path.write_text(
-              json.dumps(node_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-
-          archive_manifest = {
-              "files": [
-                  file_record(manifest_path),
-                  file_record(binary),
-              ]
-          }
-          (root / "archive-manifest.json").write_text(
-              json.dumps(archive_manifest, ensure_ascii=False, indent=2, sort_keys=True)
-              + "\n",
-              encoding="utf-8",
-          )
-          PY
-          archive="gateway-${RELEASE_VERSION}-linux-x86_64.tar.gz"
+          archive="forge-gateway-v${RELEASE_VERSION}-ubuntu20.04-x86_64.tar.gz"
           tar \
             --sort=name \
             --mtime='UTC 1970-01-01' \
@@ -116,53 +64,16 @@ jobs:
             --numeric-owner \
             -C dist \
             -czf "${archive}" \
-            node-manifest.json gateway archive-manifest.json
+            gateway
           sha256sum "${archive}" > "${archive}.sha256"
-          uv run --no-project --python 3.12 python - "${archive}" <<'PY'
-          import hashlib
-          import json
-          import sys
-          import tarfile
-
-          archive = sys.argv[1]
-          with tarfile.open(archive, "r:gz") as bundle:
-              members = {member.name: member for member in bundle.getmembers()}
-              expected = {
-                  "node-manifest.json",
-                  "gateway",
-                  "archive-manifest.json",
-              }
-              assert set(members) == expected
-              assert members["gateway"].mode & 0o111
-              contents = {
-                  name: bundle.extractfile(members[name]).read()
-                  for name in expected
-              }
-
-          node_manifest = json.loads(contents["node-manifest.json"])
-          declared_digest = node_manifest.pop("digest")
-          canonical = json.dumps(
-              node_manifest,
-              ensure_ascii=False,
-              separators=(",", ":"),
-              sort_keys=True,
-          ).encode()
-          assert hashlib.sha256(canonical).hexdigest() == declared_digest
-          assert node_manifest["entrypoints"] == {"gateway": "gateway"}
-
-          archive_manifest = json.loads(contents["archive-manifest.json"])
-          records = {item["path"]: item for item in archive_manifest["files"]}
-          assert set(records) == {"node-manifest.json", "gateway"}
-          for name, record in records.items():
-              assert record["size"] == len(contents[name])
-              assert record["sha256"] == hashlib.sha256(contents[name]).hexdigest()
-          PY
+          test "$(tar -tzf "${archive}")" = "gateway"
+          sha256sum --check "${archive}.sha256"
 
       - uses: actions/upload-artifact@v6
         with:
-          name: gateway-${{ inputs.version }}-linux-x86_64
+          name: forge-gateway-v${{ inputs.version }}-ubuntu20.04-x86_64
           path: |
-            gateway-${{ inputs.version }}-linux-x86_64.tar.gz
-            gateway-${{ inputs.version }}-linux-x86_64.tar.gz.sha256
+            forge-gateway-v${{ inputs.version }}-ubuntu20.04-x86_64.tar.gz
+            forge-gateway-v${{ inputs.version }}-ubuntu20.04-x86_64.tar.gz.sha256
           if-no-files-found: error
           retention-days: 30
