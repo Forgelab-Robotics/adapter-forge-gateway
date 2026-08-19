@@ -17,7 +17,7 @@ carrier retain their Apache-2.0 provenance as documented in
 - The unpublished `forge-tool==0.1.0` protocol source and its required
   ToolMessage Arrow carrier are included under `src/forge_tool`.
 - All 309 tests pass on Python 3.12 without physical hardware.
-- CLI reports `forge-gateway 1.0.1`.
+- CLI reports `forge-gateway 1.0.2`.
 - `pip-audit` reports no known vulnerabilities in locked runtime dependencies.
 - `detect-secrets` reports zero findings in the publishable source tree.
 - A high-confidence secret-pattern scan across all Git refs and historical

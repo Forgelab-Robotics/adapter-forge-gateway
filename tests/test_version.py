@@ -20,7 +20,7 @@ class FakeRuntime:
 def test_public_versions_match_project_metadata() -> None:
     metadata = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert metadata["project"]["version"] == __version__ == "1.0.1"
+    assert metadata["project"]["version"] == __version__ == "1.0.2"
     assert create_app(FakeRuntime()).version == __version__
 
 
