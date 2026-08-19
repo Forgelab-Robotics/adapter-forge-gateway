@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.3.3,<9",
-    "dora-rs==0.4.1",
+    "dora-rs==0.5.0",
     "fastapi>=0.141.1,<1",
     "uvicorn[standard]>=0.30,<1",
     "forge-msgs==1.0.1",
