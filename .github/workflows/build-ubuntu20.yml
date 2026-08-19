@@ -51,7 +51,7 @@ jobs:
 
       - name: Verify and package binary
         run: |
-          test "$(git describe --tags --exact-match)" = "v${RELEASE_VERSION}"
+          test "${{ inputs.ref }}" = "v${RELEASE_VERSION}"
           test "$(./dist/gateway --version)" = "forge-gateway ${RELEASE_VERSION}"
           file ./dist/gateway
           ldd --version | sed -n '1p'
