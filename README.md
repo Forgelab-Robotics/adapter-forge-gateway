@@ -2,9 +2,15 @@
 
 `gateway` 是统一的运行时入口，提供本地 HTTP 控制 API、runtime readiness/start gate，以及状态/图像 WebSocket。
 
-本目录从 `forge_runtime` commit `3d63fcf14eeb29928a9a0598dd3dd550cbebb0d6` 的 tracked snapshot 导出，现作为独立的 `forge-gateway` 项目维护。
+本项目是 Forge Gateway 的独立开源仓库，由 Forge Runtime 中的 Gateway
+节点演进而来。完整接口说明见本项目的 [Gateway API 文档](docs/api.md)，
+安全部署边界见 [SECURITY.md](SECURITY.md)，发布检查记录见
+[OPEN_SOURCE_AUDIT.md](OPEN_SOURCE_AUDIT.md)。
 
-完整接口说明见本项目的 [Gateway API 文档](docs/api.md)。
+> [!WARNING]
+> Gateway 的控制接口不内置身份认证或 TLS。默认仅监听 `127.0.0.1`；
+> 如需远程访问，必须放在可信网络和经过认证的加密反向代理之后。连接真机前，
+> 还必须独立验证急停、工作区隔离和设备安全限制。
 
 ## 独立开发
 
@@ -30,7 +36,7 @@ uv run python main.py --help
 uv run python main.py --version  # forge-gateway 1.0.1
 ```
 
-这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。Tool Gateway 要求通过 `uv sync --frozen` 使用 lock 中同一 Forge commit 的 `forge-msgs` 与 `forge-tool`，且该 coordinated Forge revision 必须支持 instance-less `tool.*` Dora carrier；dependency pin 由协调变更原子更新。普通 `pip install .` 不属于受支持的原子部署路径。
+这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。依赖通过公开索引锁定；尚未独立发布的 Apache-2.0 `forge-tool` 协议实现随源码仓库提供，以保证公开 checkout 可复现运行。普通 `pip install .` 不属于受支持的部署路径。
 
 构建独立可执行文件：
 
@@ -184,3 +190,11 @@ uv run python main.py --config gateway.yaml --print-capabilities
 所有 provider/caller Tool 输入使用同一个有界有序 FIFO，不参与图像/状态的 latest-value coalescing；FIFO 满时 Gateway 显式失败，不静默丢失 registration、invoke response 或 error。Tool outbound mailbox 同样有界：management 在 Directory mutation 前保留 ACK capacity，Dora invocation 在 admission 时保留 terminal response capacity；只剩一个 slot 时返回 immediate busy error，没有 slot 时不改变状态。HTTP 与 Dora pending invocation 总数也由同一个 service `outbound_capacity` 限制；达到上限时新 invocation 返回 `FORGE_TOOL_GATEWAY_BUSY` 且不创建 pending state，已被 lifecycle claim 的 provider request 仍计入该上限。register/unregister 的 Directory effect 保留 reader `received_at` 语义；Query deadline 从 lifecycle `processed_at` 开始，并要求 provider response 在 deadline 前完成 lifecycle processing，deadline 前进入 reader FIFO 但尚未处理的 response 不会延长 deadline。
 
 provider invoke 的 dispatch linearization point 是 lifecycle 在 `ToolGatewayService` lock 下从 mailbox claim request，并同步标记 `dispatch_claimed`。timeout/cancel/close 在 claim 前发生时，该 request 会失效且不会调用 Dora `send_output`；claim 后 Dora send 仍在 lock 外执行，因此可能继续发给 provider。所有异步 terminal completion 在 service lock 下统一仲裁：其 monotonic observation 达到或超过 pending deadline 时必须返回 `FORGE_TOOL_INVOKE_TIMEOUT`（HTTP `504`），而不是更晚发生的 provider、transport、caller-cancelled 或 closing 结果；deadline 前已完成线性化的结果保持不变。pending 已结束后的合法 provider response/error 视为 late/duplicate 并静默丢弃。该有限的 claim-after-effect 只适用于无 Gateway retry/cancel 协议的 Query，不适用于 Action 或 Session。每次 lifecycle drain 有固定上限，shutdown 会在 lifecycle thread 做一次最终 bounded caller-response drain。HTTP handler 的独立 monotonic wait 是 hard upper bound；它与 lifecycle sweep 共享同一个原子 cancellation/completion path。
+
+## 开源与许可证
+
+本仓库自有代码、配置、静态资源和文档采用
+[Apache License 2.0](LICENSE)。运行时依赖不随源码仓库分发，并保留各自的
+许可证；详见 [NOTICE](NOTICE) 和
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。发布独立可执行文件前，
+需要对 PyInstaller 产物中的完整依赖集合另行执行许可证审查。

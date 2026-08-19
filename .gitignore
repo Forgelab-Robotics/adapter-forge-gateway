@@ -23,7 +23,19 @@ build/
 dist/
 *.egg-info/
 
+# Runtime data and local configuration
+out/
+logs/
+*.log
+*.mcap
+.env
+.env.*
+gateway_events.jsonl
+runtime_context.json
+
 # Editor and operating-system files
 .DS_Store
+.idea/
+.vscode/
 *.swp
 *~

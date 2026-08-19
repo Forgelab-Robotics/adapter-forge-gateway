@@ -6,8 +6,8 @@ import time
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pyarrow as pa
-from forge_msgs import ToolMessage, ToolMessageSizeError
 from forge_tool import DEFAULT_MAX_MESSAGE_BYTES, ToolEnvelope, ToolProtocolError
+from forge_tool._tool_message import ToolMessage, ToolMessageSizeError
 from forge_tool.dora import tool_envelope_to_message, tool_message_to_envelope
 
 if TYPE_CHECKING:
