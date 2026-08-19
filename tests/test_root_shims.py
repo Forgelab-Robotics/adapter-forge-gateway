@@ -11,6 +11,8 @@ CONFIG_SYMBOLS = (
     "AgentConfig",
     "GatewayConfig",
     "ReadinessConfig",
+    "ToolGatewayConfig",
+    "ToolProviderRouteConfig",
     "load_action_manifest",
     "load_action_manifests",
     "load_config",

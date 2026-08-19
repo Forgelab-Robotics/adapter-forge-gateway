@@ -32,6 +32,7 @@ from forge_gateway.services.agent_service import (
 from forge_gateway.services.capability_service import CapabilityService
 from forge_gateway.services.command_service import CommandService
 from forge_gateway.services.image_service import ImageEncodeWorker
+from forge_gateway.services.tool_gateway_service import ToolGatewayService
 
 logger = get_logger(__name__)
 
@@ -50,6 +51,12 @@ class GatewayRuntime:
 
     def __init__(self, config: GatewayConfig) -> None:
         self.config = config
+        self.tool_gateway = ToolGatewayService(config.tools)
+        self.tool_provider_input_ids = self.tool_gateway.provider_input_ids
+        self.tool_caller_input_ids = self.tool_gateway.caller_input_ids
+        self.tool_input_ids = self.tool_gateway.input_ids
+
+        # Tool endpoint discovery is intentionally distinct from PAOS action dispatch.
         self.action_registry = ActionRegistry.from_actions(config.agent.actions)
         self.capability_service = CapabilityService(
             policy_id=config.policy_id,
@@ -109,6 +116,7 @@ class GatewayRuntime:
         self.event_log_path: Path | None = self.state_store.event_log_path
         self.snapshot_path: Path | None = self.state_store.snapshot_path
         self.image_encoder = ImageEncodeWorker(self)
+
 
     @property
     def dispatch_blocked_reason(self) -> str | None:
@@ -431,6 +439,7 @@ class GatewayRuntime:
         with self.lock:
             if self._phase != "running":
                 return
+            self.tool_gateway.begin_close()
             self.image_encoder.reject_submissions()
             self._phase = "closing"
 
@@ -445,6 +454,7 @@ class GatewayRuntime:
                     raise RuntimeError("gateway close attempt is missing")
             else:
                 if self._phase == "running":
+                    self.tool_gateway.begin_close()
                     self.image_encoder.reject_submissions()
                     self._phase = "closing"
                 self._close_in_progress = True
@@ -457,6 +467,11 @@ class GatewayRuntime:
             return self._completed_close_result(attempt)
 
         close_errors: list[BaseException] = []
+        try:
+            self.tool_gateway.close()
+        except BaseException as error:
+            close_errors.append(error)
+
         try:
             self.image_encoder.request_stop()
         except BaseException as error:

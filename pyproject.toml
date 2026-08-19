@@ -8,8 +8,9 @@ dependencies = [
     "dora-rs==0.4.1",
     "fastapi",
     "uvicorn[standard]",
-    "forge-msgs>=1.0.0,<2",
+    "forge-msgs>=1.1.0,<2",
     "forge-common>=1.0.0,<2",
+    "forge-tool[dora]>=0.1.0,<0.2",
     "opencv-python",
     "pyyaml",
 ]
@@ -33,8 +34,9 @@ testpaths = ["tests"]
 package = false
 
 [tool.uv.sources]
-forge-msgs = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git", tag = "forge-msgs-v1.0.0", subdirectory = "packages/msgs" }
+forge-msgs = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git", rev = "b4c13e8b37afd1825c3b55fc70149757dc827c66", subdirectory = "packages/msgs" }
 forge-common = { git = "https://gitlab.ex-ai.cn/meta-emt/framework/forge.git", tag = "forge-common-v1.0.0", subdirectory = "packages/common" }
+forge-tool = { git = "https://gitlab.ex-ai.cn/PhyAgentOS/framework/forge.git", rev = "b4c13e8b37afd1825c3b55fc70149757dc827c66", subdirectory = "packages/tool" }
 
 [tool.pyright]
 venvPath = "."

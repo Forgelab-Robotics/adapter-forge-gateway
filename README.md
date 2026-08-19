@@ -30,7 +30,7 @@ uv run python main.py --help
 uv run python main.py --version  # forge-gateway 1.0.1
 ```
 
-这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。
+这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。Tool Gateway 要求通过 `uv sync --frozen` 使用 lock 中同一 Forge commit 的 `forge-msgs` 与 `forge-tool`，且该 coordinated Forge revision 必须支持 instance-less `tool.*` Dora carrier；dependency pin 由协调变更原子更新。普通 `pip install .` 不属于受支持的原子部署路径。
 
 构建独立可执行文件：
 
@@ -74,6 +74,18 @@ readiness:
   require_image_client: false
   proprio_stale_after_sec: 2.0  # 设为 null 可显式使用旧的 presence-only 行为
   image_stale_after_sec: 2.0
+
+tools:
+  enabled: false
+  lease_ttl_ms: 15000
+  invoke_timeout_ms: 5000  # 所有 caller timeout 的最大值
+  request_input_id: tool_request
+  response_output_id: tool_response
+  providers: []
+  # providers:
+  #   - endpoint_id: vision.yolo
+  #     input_id: yolo/to_gateway
+  #     output_id: gateway/to_yolo
 ```
 
 Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形式的布尔值、非有限数值、空/重复 input ID 都会直接报错。`agent.max_active_sessions` 当前只允许整数 `1`；旧的 `broadcast_hz` alias 仍可单独使用，但不能与 `state_broadcast_hz` 同时配置。
@@ -81,6 +93,10 @@ Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形
 当 `readiness.require_images: true` 时，`image_input_ids` 不能为空，否则 readiness 会报告缺少 `image_input_ids`。本体状态必须携带 position、velocity 或 effort 数值，并至少匹配一个 `joint_order` 中的 joint；partial joint state 仍受支持。
 
 未配置 `agent.action_manifests` 时，Gateway 会加载 package 内置的 `piper/sam3.md`，无需复制资源或依赖当前工作目录。显式配置外部 manifest 时，相对路径仍按 YAML 配置文件所在目录解析。
+
+`tools.enabled: true` 时，Gateway 可以作为 Tool-only Dora 节点启动，不要求 `joint_order`。Gateway 是唯一 caller-visible discovery/routing authority：provider 共享输入接受 management、invoke/status/result/control response、`tool.event` 和 `tool.error`；共享输出发送 registry response 及 pinned Tool request。
+
+Directory 对每个 `endpoint_id` 维护一个带 monotonic lease 的 current instance，并允许 Query/Action descriptor。Query 同步行为保持不变。配置 `tools.specs` 后，Action 使用独立有界 invocation store：Gateway 生成 invocation/attempt、pin provider instance，并路由 invoke/status/result/control/event。terminal result 与事件按配置保留；lease expiry/provider replacement 的不确定结果记为 `unknown`。deadline 不等于 stop，cancel accepted 也不等于 cancelled。Gateway 不实现 retry、dedup、Session、PAOS 或 Skill Runtime。
 
 启动：
 
@@ -115,6 +131,11 @@ uv run python main.py --config gateway.yaml --print-capabilities
 - `POST /agent/runtime/reset`：Agent-facing 场景复位入口，内部复用 `reset_scene` runtime 命令。
 - `POST /runtime/reset_scene`：发送 `reset_scene` runtime 命令，用于仿真场景复位；不同于 playback 的 `RESET`
 - `POST /runtime/stop`
+- `GET /tools`：列出当前 active Tool descriptor；不暴露 provider instance、route 或 monotonic lease 时间。
+- `GET /tools/{tool_id}`、`GET /tools/{tool_id}/context`：读取 ToolSpec 与 readiness/frame context。
+- `POST /tools/{tool_id}:invoke`：创建 Action invocation，返回 `202`。
+- `POST /tools/{endpoint_id}/{operation}:invoke`：调用 Query Tool，body: `{"arguments":{},"caller_id":"optional","timeout_ms":5000}`；`timeout_ms` 可省略，否则必须在 `1..tools.invoke_timeout_ms`；使用与 Dora caller 相同的 Tool Gateway service。
+- `GET /invocations/{id}`、`GET /invocations/{id}/result`、`POST /invocations/{id}/cancel`、`GET /invocations/{id}/events`：Action 状态、结果、取消和 SSE。
 
 - `POST /policy/command`：直接发送 `PolicyCommand`，body: `{"command":"...","inputs":{}}`
 - `GET /runtime/status`：返回状态快照与 readiness
@@ -151,7 +172,15 @@ uv run python main.py --config gateway.yaml --print-capabilities
 - `record_status`
 - `playback_status`
 - 配置中的 `image_input_ids`
+- `tools.request_input_id`：public caller 的 logical `tool.invoke.request`
+- `tools.providers[*].input_id`：provider 的 register/unregister/invoke.response/tool.error 共享输入
 
 输出：
 
 - `policy_command`
+- `tools.response_output_id`：public caller 的 correlated invoke.response/tool.error
+- `tools.providers[*].output_id`：发给 provider 的 registry.response/invoke.request 共享输出
+
+所有 provider/caller Tool 输入使用同一个有界有序 FIFO，不参与图像/状态的 latest-value coalescing；FIFO 满时 Gateway 显式失败，不静默丢失 registration、invoke response 或 error。Tool outbound mailbox 同样有界：management 在 Directory mutation 前保留 ACK capacity，Dora invocation 在 admission 时保留 terminal response capacity；只剩一个 slot 时返回 immediate busy error，没有 slot 时不改变状态。HTTP 与 Dora pending invocation 总数也由同一个 service `outbound_capacity` 限制；达到上限时新 invocation 返回 `FORGE_TOOL_GATEWAY_BUSY` 且不创建 pending state，已被 lifecycle claim 的 provider request 仍计入该上限。register/unregister 的 Directory effect 保留 reader `received_at` 语义；Query deadline 从 lifecycle `processed_at` 开始，并要求 provider response 在 deadline 前完成 lifecycle processing，deadline 前进入 reader FIFO 但尚未处理的 response 不会延长 deadline。
+
+provider invoke 的 dispatch linearization point 是 lifecycle 在 `ToolGatewayService` lock 下从 mailbox claim request，并同步标记 `dispatch_claimed`。timeout/cancel/close 在 claim 前发生时，该 request 会失效且不会调用 Dora `send_output`；claim 后 Dora send 仍在 lock 外执行，因此可能继续发给 provider。所有异步 terminal completion 在 service lock 下统一仲裁：其 monotonic observation 达到或超过 pending deadline 时必须返回 `FORGE_TOOL_INVOKE_TIMEOUT`（HTTP `504`），而不是更晚发生的 provider、transport、caller-cancelled 或 closing 结果；deadline 前已完成线性化的结果保持不变。pending 已结束后的合法 provider response/error 视为 late/duplicate 并静默丢弃。该有限的 claim-after-effect 只适用于无 Gateway retry/cancel 协议的 Query，不适用于 Action 或 Session。每次 lifecycle drain 有固定上限，shutdown 会在 lifecycle thread 做一次最终 bounded caller-response drain。HTTP handler 的独立 monotonic wait 是 hard upper bound；它与 lifecycle sweep 共享同一个原子 cancellation/completion path。

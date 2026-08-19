@@ -7,6 +7,7 @@ import threading
 from dataclasses import replace
 import time
 from collections import deque
+from collections.abc import Collection
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Never
 
@@ -27,14 +28,40 @@ from forge_gateway.domain.node_status import NodeStatus
 
 logger = get_logger(__name__)
 
-class DoraEventBuffer:
-    """Coalesce high-rate Dora input events so stale images cannot accumulate."""
+_DEFAULT_FIFO_CAPACITY = 256
 
-    def __init__(self) -> None:
+
+class DoraEventBufferOverflow(BufferError):
+    """A lossless Dora input FIFO reached its configured finite capacity."""
+
+
+class DoraEventBuffer:
+    """Coalesce normal inputs while preserving configured inputs in a bounded FIFO."""
+
+    def __init__(
+        self,
+        *,
+        fifo_input_ids: Collection[str] = (),
+        fifo_capacity: int = _DEFAULT_FIFO_CAPACITY,
+    ) -> None:
+        if (
+            isinstance(fifo_capacity, bool)
+            or not isinstance(fifo_capacity, int)
+            or fifo_capacity < 1
+        ):
+            raise ValueError("fifo_capacity must be a positive integer")
+        if any(
+            not isinstance(input_id, str) or not input_id for input_id in fifo_input_ids
+        ):
+            raise ValueError("fifo_input_ids must contain non-empty strings")
+
         self._condition = threading.Condition()
         self._events: deque[Any] = deque()
         self._input_order: deque[str] = deque()
         self._latest_inputs: dict[str, Any] = {}
+        self._fifo_input_ids = frozenset(fifo_input_ids)
+        self._fifo_input_count = 0
+        self._fifo_capacity = fifo_capacity
         self._pending_ticks = 0
 
     def put(self, event: Any) -> None:
@@ -43,6 +70,14 @@ class DoraEventBuffer:
                 input_id = str(event.get("id"))
                 if input_id == "tick":
                     self._pending_ticks += 1
+                elif input_id in self._fifo_input_ids:
+                    if self._fifo_input_count >= self._fifo_capacity:
+                        raise DoraEventBufferOverflow(
+                            "Dora input FIFO capacity "
+                            f"{self._fifo_capacity} exceeded by {input_id!r}"
+                        )
+                    self._events.append(event)
+                    self._fifo_input_count += 1
                 elif input_id not in self._latest_inputs:
                     self._input_order.append(input_id)
                     self._latest_inputs[input_id] = event
@@ -55,14 +90,18 @@ class DoraEventBuffer:
     def get(self, timeout: float) -> Any | None:
         deadline = time.monotonic() + timeout
         with self._condition:
-            while not self._events and not self._input_order and self._pending_ticks == 0:
+            while (
+                not self._events
+                and not self._input_order
+                and self._pending_ticks == 0
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._condition.wait(timeout=remaining)
 
             if self._events:
-                return self._events.popleft()
+                return self._pop_priority_event()
 
             if self._pending_ticks > 0:
                 self._pending_ticks -= 1
@@ -70,6 +109,23 @@ class DoraEventBuffer:
 
             input_id = self._input_order.popleft()
             return self._latest_inputs.pop(input_id)
+
+    def get_priority(self) -> Any | None:
+        """Return the next lossless/control event without consuming coalesced inputs."""
+        with self._condition:
+            if not self._events:
+                return None
+            return self._pop_priority_event()
+
+    def _pop_priority_event(self) -> Any:
+        event = self._events.popleft()
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "INPUT"
+            and str(event.get("id")) in self._fifo_input_ids
+        ):
+            self._fifo_input_count -= 1
+        return event
 
 def _joint_values_by_name(msg: Any) -> dict[str, float]:
     for field in ("position", "velocity", "effort"):
