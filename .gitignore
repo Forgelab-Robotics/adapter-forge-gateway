@@ -1,0 +1,41 @@
+# Virtual environments
+.venv/
+.venv_build/
+venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Coverage output
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Runtime data and local configuration
+out/
+logs/
+*.log
+*.mcap
+.env
+.env.*
+gateway_events.jsonl
+runtime_context.json
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

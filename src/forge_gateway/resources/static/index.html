@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Forge Gateway 数据采集控制面板"
+    />
+    <title>Forge Collector</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <p class="eyebrow">FORGE RUNTIME</p>
+            <h1>数据采集台</h1>
+          </div>
+        </div>
+
+        <div class="connection-strip" aria-label="连接状态">
+          <span class="status-pill is-offline" id="gatewayConnection">
+            <span class="status-dot" aria-hidden="true"></span>
+            Gateway 离线
+          </span>
+          <span class="status-pill is-offline" id="stateConnection">
+            <span class="status-dot" aria-hidden="true"></span>
+            状态流断开
+          </span>
+          <span class="status-pill is-offline" id="imageConnection">
+            <span class="status-dot" aria-hidden="true"></span>
+            图像流断开
+          </span>
+        </div>
+      </header>
+
+      <main>
+        <section class="record-overview panel" aria-labelledby="recordOverviewTitle">
+          <div class="record-state-wrap">
+            <div class="record-indicator" id="recordIndicator" aria-hidden="true"></div>
+            <div>
+              <p class="section-kicker" id="recordOverviewTitle">RECORDER</p>
+              <div class="state-line">
+                <strong id="recordState">等待连接</strong>
+                <span class="readiness-badge is-waiting" id="readinessBadge">检查数据源</span>
+              </div>
+              <p class="muted" id="recordHint" aria-live="polite">
+                正在连接 Gateway…
+              </p>
+            </div>
+          </div>
+
+          <dl class="metric-row">
+            <div class="metric">
+              <dt>本页计时</dt>
+              <dd id="recordDuration">00:00:00</dd>
+            </div>
+            <div class="metric">
+              <dt>当前帧数</dt>
+              <dd id="recordFrames">0</dd>
+            </div>
+            <div class="metric">
+              <dt>已保留 Episode</dt>
+              <dd id="episodeCount">0</dd>
+            </div>
+            <div class="metric metric-path">
+              <dt id="recordPathLabel">输出路径</dt>
+              <dd id="recordPath" title="">—</dd>
+            </div>
+          </dl>
+        </section>
+
+        <div class="primary-layout">
+          <section class="panel camera-panel" aria-labelledby="cameraTitle">
+            <div class="panel-heading">
+              <div>
+                <p class="section-kicker">LIVE VIEW</p>
+                <h2 id="cameraTitle">实时相机</h2>
+              </div>
+              <span class="count-badge" id="cameraCount">0 路</span>
+            </div>
+            <div class="camera-grid" id="cameraGrid">
+              <div class="empty-state" id="cameraEmpty">
+                <div class="empty-icon" aria-hidden="true">◎</div>
+                <strong>等待相机配置</strong>
+                <span>连接状态流后将自动显示所有图像输入</span>
+              </div>
+            </div>
+          </section>
+
+          <aside class="panel control-panel" aria-labelledby="controlTitle">
+            <div class="panel-heading">
+              <div>
+                <p class="section-kicker">COLLECTION</p>
+                <h2 id="controlTitle">采集配置</h2>
+              </div>
+              <button class="button button-quiet button-small" id="regeneratePathButton" type="button">
+                生成新路径
+              </button>
+            </div>
+
+            <form id="collectionForm" novalidate>
+              <div class="form-grid two-columns">
+                <label class="field">
+                  <span>任务名</span>
+                  <input id="taskName" name="taskName" type="text" value="teleop" required maxlength="80" autocomplete="off" />
+                </label>
+                <label class="field">
+                  <span>Episode ID</span>
+                  <input id="episodeId" name="episodeId" type="text" value="episode-001" required maxlength="80" autocomplete="off" />
+                </label>
+              </div>
+
+              <label class="field">
+                <span>操作员 <small>可选</small></span>
+                <input id="operatorName" name="operatorName" type="text" maxlength="80" autocomplete="name" />
+              </label>
+
+              <label class="field">
+                <span>输出路径</span>
+                <input id="outputPath" name="outputPath" type="text" required spellcheck="false" autocomplete="off" aria-describedby="pathHelp" />
+                <small id="pathHelp">相对于运行 dataflow 的目录；必须以 .mcap 结尾</small>
+              </label>
+
+              <label class="field">
+                <span>备注 <small>可选</small></span>
+                <textarea id="notes" name="notes" rows="3" maxlength="1000" placeholder="记录场景、目标、异常或重采原因"></textarea>
+              </label>
+
+              <div class="form-error" id="formError" role="alert" hidden></div>
+
+              <div class="record-actions">
+                <button class="button button-primary button-large" id="startButton" type="submit" disabled>
+                  <span class="button-icon record-icon" aria-hidden="true"></span>
+                  开始录制
+                </button>
+                <button class="button button-success" id="stopButton" type="button" disabled>
+                  <span class="button-icon stop-icon" aria-hidden="true"></span>
+                  停止并保留
+                </button>
+                <button class="button button-danger" id="discardButton" type="button" disabled>
+                  丢弃本次
+                </button>
+              </div>
+            </form>
+
+            <div class="command-status" id="commandStatus" aria-live="polite">
+              等待数据源就绪后可开始采集
+            </div>
+
+            <div class="control-divider"></div>
+
+            <div class="secondary-action">
+              <div>
+                <strong>场景控制</strong>
+                <p>录制开始前可将仿真恢复到初始状态</p>
+              </div>
+              <button class="button button-secondary" id="resetButton" type="button" disabled>
+                复位场景
+              </button>
+            </div>
+          </aside>
+        </div>
+
+        <div class="secondary-layout">
+          <section class="panel readiness-panel" aria-labelledby="readinessTitle">
+            <div class="panel-heading compact">
+              <div>
+                <p class="section-kicker">READINESS</p>
+                <h2 id="readinessTitle">数据就绪检查</h2>
+              </div>
+              <span class="readiness-summary" id="readinessSummary">等待状态</span>
+            </div>
+            <div class="readiness-list" id="readinessList">
+              <div class="check-row is-pending">
+                <span class="check-mark" aria-hidden="true"></span>
+                <span>等待 Gateway 状态流</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel joints-panel" aria-labelledby="jointsTitle">
+            <div class="panel-heading compact">
+              <div>
+                <p class="section-kicker">ROBOT STATE</p>
+                <h2 id="jointsTitle">关节状态</h2>
+              </div>
+              <span class="muted" id="jointCount">0 joints</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">关节</th>
+                    <th scope="col">实测值</th>
+                    <th scope="col">指令值</th>
+                    <th scope="col">偏差</th>
+                  </tr>
+                </thead>
+                <tbody id="jointTableBody">
+                  <tr class="placeholder-row">
+                    <td colspan="4">等待 proprio_state / action</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel diagnostics-panel" aria-labelledby="diagnosticsTitle">
+            <div class="panel-heading compact">
+              <div>
+                <p class="section-kicker">DIAGNOSTICS</p>
+                <h2 id="diagnosticsTitle">运行诊断</h2>
+              </div>
+              <span class="sim-state" id="simState">UNINITIALIZED</span>
+            </div>
+            <dl class="diagnostic-grid">
+              <div>
+                <dt>跳过帧</dt>
+                <dd id="skippedFrames">0</dd>
+              </div>
+              <div>
+                <dt>合并输入</dt>
+                <dd id="coalescedInputs">0</dd>
+              </div>
+              <div>
+                <dt>Gateway Tick</dt>
+                <dd id="gatewayFrames">0</dd>
+              </div>
+              <div>
+                <dt>运行时间</dt>
+                <dd id="gatewayUptime">—</dd>
+              </div>
+            </dl>
+            <div class="diagnostic-message" id="diagnosticMessage">
+              暂无运行错误
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <footer>
+        <span>Forge Gateway Collector</span>
+        <span>API 文档：<a href="/docs" target="_blank" rel="noreferrer">/docs</a></span>
+      </footer>
+    </div>
+
+    <dialog class="confirm-dialog" id="confirmDialog" aria-labelledby="confirmTitle">
+      <form method="dialog">
+        <p class="section-kicker">CONFIRM ACTION</p>
+        <h2 id="confirmTitle">确认操作</h2>
+        <p id="confirmMessage"></p>
+        <div class="dialog-actions">
+          <button class="button button-secondary" value="cancel">取消</button>
+          <button class="button button-danger" id="confirmActionButton" value="confirm">确认</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="false"></div>
+  </body>
+</html>
