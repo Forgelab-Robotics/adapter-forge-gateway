@@ -69,7 +69,7 @@ def test_root_main_version_prefers_checkout_src(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "forge-gateway 1.0.1\n"
+    assert result.stdout == "forge-gateway 1.0.2\n"
 
 
 def test_root_config_forwards_head_symbols_and_prefers_checkout_src(tmp_path: Path) -> None:

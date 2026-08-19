@@ -1,0 +1,74 @@
+name: Build Ubuntu 20.04 binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: true
+        default: v1.0.2
+      version:
+        description: Gateway version without the v prefix
+        required: true
+        default: 1.0.2
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Install system tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            ca-certificates \
+            curl \
+            file \
+            git
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install uv and Python 3.12
+        run: |
+          curl -LsSf https://astral.sh/uv/0.12.5/install.sh |
+            env UV_INSTALL_DIR=/usr/local/bin sh
+          uv python install 3.12
+          uv --version
+          uv run --no-project --python 3.12 python --version
+
+      - name: Build with PyInstaller
+        run: ./scripts/build_pyinstaller.sh
+
+      - name: Verify and package artifact
+        run: |
+          test "$(./dist/gateway --version)" = "forge-gateway ${RELEASE_VERSION}"
+          file ./dist/gateway
+          ldd --version | sed -n '1p'
+          {
+            echo "version=${RELEASE_VERSION}"
+            echo "git_ref=${{ inputs.ref }}"
+            echo "git_commit=$(git rev-parse HEAD)"
+            echo "build_image=ubuntu:20.04"
+            ldd --version | sed -n '1p' | sed 's/^/glibc=/'
+          } > ./dist/BUILD_INFO.txt
+          archive="forge-gateway-v${RELEASE_VERSION}-ubuntu20.04-x86_64.tar.gz"
+          tar -C dist -czf "${archive}" gateway BUILD_INFO.txt
+          sha256sum "${archive}" > "${archive}.sha256"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: forge-gateway-v${{ inputs.version }}-ubuntu20.04-x86_64
+          path: |
+            forge-gateway-v${{ inputs.version }}-ubuntu20.04-x86_64.tar.gz
+            forge-gateway-v${{ inputs.version }}-ubuntu20.04-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
