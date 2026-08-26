@@ -17,19 +17,9 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
         logging.basicConfig(level=logging.INFO)
         return logging.getLogger(name)
 
-from forge_gateway.adapters.state_files import StateFileStore
 from forge_gateway.config import GatewayConfig
-from forge_gateway.domain.commands import Command, CommandMailboxUnavailable, CommandState
+from forge_gateway.domain.commands import Command, CommandMailboxUnavailable
 from forge_gateway.domain.node_status import NodeStatus
-from forge_gateway.domain.sessions import SessionState
-from forge_gateway.services.action_registry import ActionRegistry
-from forge_gateway.services.agent_service import (
-    AgentEvent,
-    AgentService,
-    PolicyCommandStatusUpdate,
-    PreparedSession,
-)
-from forge_gateway.services.capability_service import CapabilityService
 from forge_gateway.services.command_service import CommandService
 from forge_gateway.services.image_service import ImageEncodeWorker
 from forge_gateway.services.tool_gateway_service import ToolGatewayService
@@ -56,13 +46,6 @@ class GatewayRuntime:
         self.tool_caller_input_ids = self.tool_gateway.caller_input_ids
         self.tool_input_ids = self.tool_gateway.input_ids
 
-        # Tool endpoint discovery is intentionally distinct from PAOS action dispatch.
-        self.action_registry = ActionRegistry.from_actions(config.agent.actions)
-        self.capability_service = CapabilityService(
-            policy_id=config.policy_id,
-            action_manifests=config.agent.action_manifests,
-            action_registry=self.action_registry,
-        )
         self.lock = threading.Lock()
         self._phase: RuntimePhase = "running"
         self._dispatch_condition = threading.Condition(self.lock)
@@ -74,14 +57,8 @@ class GatewayRuntime:
             default_policy_id=config.policy_id,
             capacity=config.command_queue_capacity,
         )
-        self.agent_service = AgentService(
-            config=config.agent,
-            action_registry=self.action_registry,
-            command_sink=self.command_service,
-        )
         # Keep these aliases while callers migrate to the command service boundary.
         self.command_queue = self.command_service.command_queue
-        self.safety_command_queue = self.command_service.safety_command_queue
         self.record_root: Path | None = None
         self.last_error: str | None = None
         self.start_time = time.time()
@@ -108,13 +85,6 @@ class GatewayRuntime:
         self.state_ws_clients = 0
         self.image_ws_clients = 0
         self.nodes: dict[str, NodeStatus] = {}
-        self.state_store = StateFileStore(
-            config.agent.state_dir,
-            write_context_snapshot=config.agent.write_context_snapshot,
-        )
-        self.state_dir: Path | None = self.state_store.state_dir
-        self.event_log_path: Path | None = self.state_store.event_log_path
-        self.snapshot_path: Path | None = self.state_store.snapshot_path
         self.image_encoder = ImageEncodeWorker(self)
 
 
@@ -128,38 +98,6 @@ class GatewayRuntime:
             return self._phase
 
 
-    @property
-    def sessions(self) -> dict[str, SessionState]:
-        return self.agent_service.sessions
-
-    @sessions.setter
-    def sessions(self, value: dict[str, SessionState]) -> None:
-        self.agent_service.sessions = value
-
-    @property
-    def commands(self) -> dict[str, CommandState]:
-        return self.agent_service.commands
-
-    @commands.setter
-    def commands(self, value: dict[str, CommandState]) -> None:
-        self.agent_service.commands = value
-
-    @property
-    def active_session_id(self) -> str | None:
-        return self.agent_service.active_session_id
-
-    @active_session_id.setter
-    def active_session_id(self, value: str | None) -> None:
-        self.agent_service.active_session_id = value
-
-    @property
-    def last_result(self) -> dict[str, Any] | None:
-        return self.agent_service.last_result
-
-    @last_result.setter
-    def last_result(self, value: dict[str, Any] | None) -> None:
-        self.agent_service.last_result = value
-
     def enqueue_policy_command(
         self,
         command: str,
@@ -167,10 +105,6 @@ class GatewayRuntime:
         *,
         request_id: str = "",
         policy_id: str | None = None,
-        tracked_command_id: str | None = None,
-        retry_on_failure: bool = False,
-        attempt: int = 0,
-        safety: bool = False,
     ) -> None:
         with self.lock:
             if self._phase != "running":
@@ -182,10 +116,6 @@ class GatewayRuntime:
                 inputs,
                 request_id=request_id,
                 policy_id=policy_id,
-                tracked_command_id=tracked_command_id,
-                retry_on_failure=retry_on_failure,
-                attempt=attempt,
-                safety=safety,
             )
 
     def enqueue_policy_command_if_ready(
@@ -219,20 +149,6 @@ class GatewayRuntime:
     def command_dispatch_allowed(self) -> bool:
         return self.command_service.command_dispatch_allowed()
 
-    def block_command_dispatch(self, error: Exception) -> None:
-        now = time.time()
-        reason = f"safety command dispatch exhausted retries: {error}"
-        with self.lock:
-            if not self.command_service.block_command_dispatch(reason):
-                return
-            self.last_error = reason
-            self._append_event_locked(
-                "command_dispatch_blocked",
-                {"error": str(error)},
-                now=now,
-            )
-            self._write_snapshot_locked(now)
-
     def state_snapshot(self) -> dict[str, Any]:
         with self.lock:
             return self._state_snapshot_locked(time.time())
@@ -246,80 +162,9 @@ class GatewayRuntime:
                 "state": state,
             }
 
-    def agent_capabilities(self) -> dict[str, Any]:
-        return self.capability_service.payload()
-
-    def agent_runtime_status(self) -> dict[str, Any]:
-        with self.lock:
-            return {
-                "readiness": self._readiness_locked(time.time()),
-                "active_session_id": self.active_session_id,
-                "sessions": {sid: session.status for sid, session in self.sessions.items()},
-                "commands": {cid: command.status for cid, command in self.commands.items()},
-                "nodes": {node_id: node.to_dict() for node_id, node in self.nodes.items()},
-                "last_result": dict(self.last_result or {}),
-                "last_error": self.last_error,
-            }
-
-    def agent_runtime_context(self) -> dict[str, Any]:
-        with self.lock:
-            return self._runtime_context_locked(time.time())
-
-    def agent_runtime_reset(self, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
-        body = body or {}
-        inputs = body.get("inputs") or {}
-        if not isinstance(inputs, dict):
-            return 400, {"ok": False, "msg": "inputs must be an object"}
-        # Agent-facing reset reuses the legacy runtime reset_scene command so
-        # PAOS can stay on /agent/* while existing sim dataflows keep working.
-        try:
-            self.enqueue_policy_command("reset_scene", inputs)
-        except CommandMailboxUnavailable as error:
-            return 503, {"ok": False, "msg": str(error)}
-        return 202, {"ok": True, "data": {"command": "reset_scene", "inputs": inputs}}
-
-    def create_agent_session(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        prepared = self.agent_service.prepare_create(body, now=time.time())
-        if not isinstance(prepared, PreparedSession):
-            return prepared
-        with self.lock:
-            if self._phase != "running":
-                return 503, {
-                    "ok": False,
-                    "msg": f"gateway runtime is {self._phase}",
-                }
-            result, event = self.agent_service.create_session_locked(prepared)
-            if event is not None:
-                self._persist_agent_event_locked(event)
-        return result
-
-    def get_agent_session(self, session_id: str) -> tuple[int, dict[str, Any]]:
-        with self.lock:
-            return self.agent_service.get_session_locked(session_id)
-
-    def cancel_agent_session(self, session_id: str) -> tuple[int, dict[str, Any]]:
-        now = time.time()
-        with self.lock:
-            if self._phase != "running":
-                return 503, {
-                    "ok": False,
-                    "msg": f"gateway runtime is {self._phase}",
-                }
-            result, event = self.agent_service.cancel_session_locked(
-                session_id,
-                now=now,
-            )
-            if event is not None:
-                self._persist_agent_event_locked(event)
-        return result
-
-    def claim_command_dispatch(self, command_id: str | None) -> bool:
+    def claim_command_dispatch(self) -> bool:
         with self._dispatch_condition:
             if self._phase != "running":
-                return False
-            if command_id and not self.agent_service.claim_command_dispatch_locked(
-                command_id
-            ):
                 return False
             self._inflight_dispatches += 1
             return True
@@ -332,51 +177,10 @@ class GatewayRuntime:
             if self._inflight_dispatches == 0:
                 self._dispatch_condition.notify_all()
 
-    def mark_command_sent(self, command_id: str) -> None:
-        if not command_id:
-            return
-        now = time.time()
-        with self.lock:
-            event = self.agent_service.mark_command_sent_locked(
-                command_id,
-                now=now,
-            )
-            if event is not None:
-                self._persist_agent_event_locked(event)
-
-    def mark_command_dispatch_failed(self, command_id: str, error: Exception) -> None:
-        now = time.time()
+    def mark_command_dispatch_failed(self, error: Exception) -> None:
         message = f"policy command dispatch failed: {error}"
         with self.lock:
             self.last_error = message
-            event = self.agent_service.mark_command_dispatch_failed_locked(
-                command_id,
-                message=message,
-                error_text=str(error),
-                now=now,
-            )
-            if event is not None:
-                self._persist_agent_event_locked(event)
-
-    def apply_policy_command_status(self, value: object) -> None:
-        from forge_msgs import PolicyCommandStatus
-
-        status_msg = PolicyCommandStatus.from_arrow(value)  # type: ignore[arg-type]
-        update = PolicyCommandStatusUpdate(
-            policy_id=status_msg.policy_id,
-            command=status_msg.command,
-            request_id=status_msg.request_id,
-            status=status_msg.status,
-            message=status_msg.message,
-            outputs=dict(status_msg.outputs()),
-        )
-        now = time.time()
-        with self.lock:
-            event = self.agent_service.apply_policy_command_status_locked(
-                update,
-                now=now,
-            )
-            self._persist_agent_event_locked(event)
 
     def publish_image_payload(
         self,
@@ -519,16 +323,8 @@ class GatewayRuntime:
             attempt.error = close_error
             if failure_reasons:
                 self.last_error = "; ".join(failure_reasons)
-            try:
-                self._write_snapshot_locked(time.time())
-            except BaseException as error:
-                close_errors.append(error)
-                attempt.error = self._combine_close_errors(close_errors)
-                attempt.succeeded = False
-                self._phase = "closing"
-            finally:
-                self._close_in_progress = False
-                attempt.completed.set()
+            self._close_in_progress = False
+            attempt.completed.set()
 
         return self._completed_close_result(attempt)
 
@@ -633,34 +429,4 @@ class GatewayRuntime:
             "state_client_ready": state_client_ready,
             "image_client_ready": image_client_ready,
         }
-
-    def _runtime_context_locked(self, now: float) -> dict[str, Any]:
-        return {
-            "updated_at": now,
-            "capabilities": self.agent_capabilities(),
-            "readiness": self._readiness_locked(now),
-            "active_session_id": self.active_session_id,
-            "sessions": {sid: session.to_dict() for sid, session in self.sessions.items()},
-            "commands": {cid: command.to_dict() for cid, command in self.commands.items()},
-            "nodes": {node_id: node.to_dict() for node_id, node in self.nodes.items()},
-            "last_result": dict(self.last_result or {}),
-            "last_error": self.last_error,
-            "runtime": {
-                "phase": self._phase,
-                "current_frame_count": self.current_frame_count,
-                "sim_status": dict(self.sim_status),
-                "record_status": dict(self.record_status),
-                "playback_status": dict(self.playback_status),
-            },
-        }
-
-    def _persist_agent_event_locked(self, event: AgentEvent) -> None:
-        self._append_event_locked(event.event_type, event.data, now=event.now)
-        self._write_snapshot_locked(event.now)
-
-    def _append_event_locked(self, event_type: str, data: dict[str, Any], *, now: float) -> None:
-        self.state_store.append_event(event_type, data, now=now)
-
-    def _write_snapshot_locked(self, now: float) -> None:
-        self.state_store.write_snapshot(self._runtime_context_locked(now))
 

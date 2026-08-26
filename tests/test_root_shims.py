@@ -7,20 +7,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_SYMBOLS = (
-    "AgentActionConfig",
-    "AgentConfig",
     "GatewayConfig",
     "ReadinessConfig",
     "ToolGatewayConfig",
     "ToolProviderRouteConfig",
-    "load_action_manifest",
-    "load_action_manifests",
     "load_config",
-    "_default_action_manifests",
-    "_read_frontmatter",
-    "_resolve_path",
-    "_load_action_manifest",
-    "_load_action_manifests",
     "_clamp_hz",
     "os",
     "dataclass",

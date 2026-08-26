@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import replace
 import time
 from collections import deque
 from collections.abc import Collection
@@ -211,10 +210,6 @@ def handle_dora_input(runtime: GatewayRuntime, input_id: str, value: object) -> 
                 runtime.nodes["playback_status"] = NodeStatus("playback_status", "ready", now, payload)
         return
 
-    if input_id == "policy_command_status":
-        runtime.apply_policy_command_status(value)
-        return
-
     if input_id in runtime.config.image_input_ids:
         runtime.image_encoder.submit(input_id, value, now)
 
@@ -247,13 +242,8 @@ def _json_bytes(value: object) -> Any:
 
 
 def handle_command(runtime: GatewayRuntime, node: Any, cmd: Command) -> None:
-    tracked_command_id = cmd.tracked_command_id
-    if not runtime.claim_command_dispatch(tracked_command_id):
-        logger.info(
-            "gateway: skip inactive command kind=%s tracked_command_id=%s",
-            cmd.kind,
-            tracked_command_id,
-        )
+    if not runtime.claim_command_dispatch():
+        logger.info("gateway: skip command while runtime is closing kind=%s", cmd.kind)
         return
 
     try:
@@ -297,9 +287,8 @@ def handle_command(runtime: GatewayRuntime, node: Any, cmd: Command) -> None:
             )
             node.send_output("policy_command", msg.to_arrow())
         except Exception as error:
-            runtime.mark_command_dispatch_failed(tracked_command_id or "", error)
+            runtime.mark_command_dispatch_failed(error)
             raise
-        runtime.mark_command_sent(tracked_command_id or "")
     finally:
         runtime.release_command_dispatch()
 
@@ -309,17 +298,8 @@ def drain_commands(runtime: GatewayRuntime, node: Any) -> None:
         cmd = runtime.take_next_command()
         if cmd is None:
             return
-        current = cmd
-        while True:
-            try:
-                handle_command(runtime, node, current)
-                break
-            except Exception as error:
-                logger.error("gateway: dispatch failed: %s", error)
-                if not current.retry_on_failure:
-                    break
-                if current.attempt >= 2:
-                    runtime.block_command_dispatch(error)
-                    return
-                current = replace(current, attempt=current.attempt + 1)
+        try:
+            handle_command(runtime, node, cmd)
+        except Exception as error:
+            logger.error("gateway: dispatch failed: %s", error)
 

@@ -12,7 +12,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from forge_gateway import __version__
-from forge_gateway.controllers.agent_controller import register_agent_routes
 from forge_gateway.controllers.playback_controller import register_playback_routes
 from forge_gateway.controllers.policy_controller import register_policy_routes
 from forge_gateway.controllers.record_controller import register_record_routes
@@ -43,7 +42,6 @@ def create_app(runtime: Any, stop_event: threading.Event | None = None) -> FastA
         )
 
     register_runtime_routes(app, runtime, stop_event=stop_event)
-    register_agent_routes(app, runtime)
     register_record_routes(app, runtime)
     register_playback_routes(app, runtime)
     register_policy_routes(app, runtime)

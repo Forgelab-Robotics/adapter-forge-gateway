@@ -48,7 +48,6 @@ def _config(*, lease_ttl_ms: int = 15_000) -> GatewayConfig:
     return GatewayConfig.from_dict(
         {
             "joint_order": [],
-            "agent": {"action_manifests": []},
             "tools": {
                 "enabled": True,
                 "lease_ttl_ms": lease_ttl_ms,
@@ -733,7 +732,6 @@ def test_store_total_capacity_is_hard_bounded_by_terminal_eviction() -> None:
 def test_toolspec_binding_and_readiness_configuration_are_strict() -> None:
     base = {
         "joint_order": [],
-        "agent": {"action_manifests": []},
         "tools": {
             "enabled": True,
             "providers": [
@@ -845,7 +843,6 @@ def test_robot_frame_directions_configuration_is_strict(
         GatewayConfig.from_dict(
             {
                 "joint_order": [],
-                "agent": {"action_manifests": []},
                 "tools": {"specs": [spec]},
             }
         )

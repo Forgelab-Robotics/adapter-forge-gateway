@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import signal
 from collections.abc import Callable
 from dataclasses import replace
@@ -22,7 +21,6 @@ except Exception:  # pragma: no cover - fallback for minimal test envs
 from forge_gateway import __version__
 from forge_gateway.application import GatewayApplication
 from forge_gateway.config import load_config
-from forge_gateway.services.runtime_service import GatewayRuntime
 
 logger = get_logger(__name__)
 
@@ -37,11 +35,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default=None, help="YAML config path")
     parser.add_argument("--host", type=str, default=None, help="HTTP/WebSocket host override")
     parser.add_argument("--port", type=int, default=None, help="HTTP/WebSocket port override")
-    parser.add_argument(
-        "--print-capabilities",
-        action="store_true",
-        help="Print supported agent/runtime interfaces as JSON and exit",
-    )
     return parser.parse_args()
 
 
@@ -81,18 +74,6 @@ def main() -> int:
         config = replace(config, host=args.host)
     if args.port is not None:
         config = replace(config, port=args.port)
-
-    if args.print_capabilities:
-        runtime = GatewayRuntime(config)
-        try:
-            print(json.dumps(runtime.agent_capabilities(), ensure_ascii=False, indent=2, sort_keys=True))
-        finally:
-            try:
-                close_succeeded = runtime.close()
-            except Exception as error:
-                logger.error("gateway capability runtime cleanup failed: %s", error)
-                close_succeeded = False
-        return 0 if close_succeeded else 1
 
     if not config.joint_order and not config.tools.enabled:
         logger.error("gateway requires joint_order or an enabled Tool Gateway")

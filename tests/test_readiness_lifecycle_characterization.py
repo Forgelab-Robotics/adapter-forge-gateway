@@ -60,14 +60,6 @@ class _RacingRuntime:
         self.commands.append((command, inputs))
         return True, readiness
 
-    def agent_runtime_reset(
-        self,
-        body: dict[str, object] | None = None,
-    ) -> tuple[int, dict[str, object]]:
-        del body
-        return 202, {"ok": True}
-
-
 def _client(runtime: object) -> TestClient:
     app = FastAPI()
     register_runtime_routes(app, runtime)
@@ -89,13 +81,8 @@ def test_config_rejects_string_booleans_and_unknown_readiness_keys() -> None:
                 "readiness": {"require_image_clients": True},
             }
         )
-    with pytest.raises(ValueError, match="agent.enabled"):
-        config.GatewayConfig.from_dict(
-            {
-                "joint_order": ["j1"],
-                "agent": {"enabled": "false"},
-            }
-        )
+    with pytest.raises(ValueError, match="agent"):
+        config.GatewayConfig.from_dict({"joint_order": ["j1"], "agent": {}})
 
 
 def test_config_rejects_non_mapping_readiness_and_invalid_identifiers() -> None:
@@ -319,20 +306,6 @@ def test_closed_runtime_rejects_commands_and_is_not_ready() -> None:
         runtime.enqueue_policy_command("after_close")
     with pytest.raises(CommandMailboxUnavailable, match="gateway runtime is closed"):
         runtime.enqueue_policy_command_if_ready("after_close")
-
-    create_status, _ = runtime.create_agent_session(
-        {
-            "session_id": "closed-session",
-            "command_id": "closed-command",
-            "action_type": "grasp",
-            "target_name": "apple",
-        }
-    )
-    reset_status, _ = runtime.agent_runtime_reset()
-    cancel_status, _ = runtime.cancel_agent_session("missing-session")
-    assert create_status == 503
-    assert reset_status == 503
-    assert cancel_status == 503
 
     readiness = runtime.readiness()
     assert readiness["ready"] is False
