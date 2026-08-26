@@ -51,15 +51,6 @@ class _Runtime:
         self.enqueue_policy_command(command, inputs)
         return True, readiness
 
-    def agent_runtime_reset(
-        self,
-        body: dict[str, Any] | None = None,
-    ) -> tuple[int, dict[str, Any]]:
-        inputs = (body or {}).get("inputs") or {}
-        self.commands.append(("reset_scene", inputs))
-        return 202, {"ok": True, "data": {"command": "reset_scene", "inputs": inputs}}
-
-
 def _client(runtime: _Runtime) -> TestClient:
     app = FastAPI()
     register_runtime_routes(app, runtime)

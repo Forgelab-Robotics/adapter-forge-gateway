@@ -65,6 +65,7 @@ class ActionInvocation:
     error: ToolError | None = None
     observation_error: ToolError | None = None
     cancel_status: str | None = None
+    stop_status: str | None = None
     terminal_at: float | None = None
     accepted_established: bool = False
     occupies_concurrency: bool = True
@@ -260,6 +261,15 @@ class ActionInvocationStore:
             self._changed.notify_all()
             return True
 
+    def set_stop_status(self, key: ActionKey, status: str) -> bool:
+        with self._changed:
+            item = self._items.get(key)
+            if item is None:
+                return False
+            item.stop_status = status
+            self._changed.notify_all()
+            return True
+
     def append_event(
         self,
         key: ActionKey,
@@ -349,6 +359,11 @@ class ActionInvocationStore:
         return changed
 
     def mark_deadlines_ambiguous(self, *, now: float, epoch_ms: int) -> int:
+        # Session invocations are admitted with deadline_ms=None (see
+        # tool_gateway_service.submit_http_action) and are therefore never
+        # marked ambiguous here: a session is unbounded by design and `stop`
+        # is its only termination path. Provider death mid-session is caught
+        # by lease-expiry ambiguity instead.
         error = ToolError(
             code="FORGE_TOOL_DEADLINE_EXCEEDED_OUTCOME_UNKNOWN",
             message=(
@@ -416,6 +431,7 @@ class ActionInvocationStore:
             "accepted": item.accepted_established,
             "occupies_concurrency": item.occupies_concurrency,
             "cancel_status": item.cancel_status,
+            "stop_status": item.stop_status,
             "created_at": item.created_at,
         }
         if item.deadline_ms is not None:

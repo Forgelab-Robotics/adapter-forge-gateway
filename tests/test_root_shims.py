@@ -7,20 +7,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_SYMBOLS = (
-    "AgentActionConfig",
-    "AgentConfig",
     "GatewayConfig",
     "ReadinessConfig",
     "ToolGatewayConfig",
     "ToolProviderRouteConfig",
-    "load_action_manifest",
-    "load_action_manifests",
     "load_config",
-    "_default_action_manifests",
-    "_read_frontmatter",
-    "_resolve_path",
-    "_load_action_manifest",
-    "_load_action_manifests",
     "_clamp_hz",
     "os",
     "dataclass",
@@ -69,7 +60,7 @@ def test_root_main_version_prefers_checkout_src(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "forge-gateway 1.0.2\n"
+    assert result.stdout == "forge-gateway 1.1.0\n"
 
 
 def test_root_config_forwards_head_symbols_and_prefers_checkout_src(tmp_path: Path) -> None:

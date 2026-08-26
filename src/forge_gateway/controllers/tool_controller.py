@@ -231,7 +231,7 @@ def register_tool_routes(app: FastAPI, runtime: Any) -> None:
             )
             if (
                 operation_descriptor is not None
-                and operation_descriptor.semantics == "action"
+                and operation_descriptor.semantics in ("action", "session")
             ):
                 matching_spec = next(
                     (
@@ -239,7 +239,7 @@ def register_tool_routes(app: FastAPI, runtime: Any) -> None:
                         for spec in runtime.tool_gateway.catalog.list()
                         if spec.endpoint_id == endpoint_id
                         and spec.operation == operation
-                        and spec.semantics == "action"
+                        and spec.semantics in ("action", "session")
                     ),
                     None,
                 )
@@ -248,7 +248,7 @@ def register_tool_routes(app: FastAPI, runtime: Any) -> None:
                         409,
                         {
                             "ok": False,
-                            "msg": "Action descriptor has no matching ToolSpec binding",
+                            "msg": "Action or Session descriptor has no matching ToolSpec binding",
                         },
                     )
                 invocation = runtime.tool_gateway.submit_http_action(
@@ -354,6 +354,26 @@ def register_tool_routes(app: FastAPI, runtime: Any) -> None:
                 "data": {
                     "invocation_id": invocation_id,
                     "cancel_status": status,
+                },
+            },
+        )
+
+    @app.post("/invocations/{invocation_id}/stop")
+    async def stop_invocation(invocation_id: str) -> JSONResponse:
+        try:
+            status = runtime.tool_gateway.stop_action(invocation_id)
+        except KeyError:
+            return json_response(404, {"ok": False, "msg": "invocation not found"})
+        except RuntimeError as error:
+            return json_response(503, {"ok": False, "msg": str(error)})
+        code = 202 if status == "requested" else 200
+        return json_response(
+            code,
+            {
+                "ok": True,
+                "data": {
+                    "invocation_id": invocation_id,
+                    "stop_status": status,
                 },
             },
         )

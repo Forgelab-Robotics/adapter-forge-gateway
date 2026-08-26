@@ -76,7 +76,6 @@ def _config(
     return GatewayConfig.from_dict(
         {
             "joint_order": [],
-            "agent": {"action_manifests": []},
             "tools": {
                 "enabled": True,
                 "lease_ttl_ms": lease_ttl_ms,
@@ -236,7 +235,7 @@ def test_cli_allows_tool_only_gateway_without_joint_routes(
 
 def test_tools_defaults_and_runtime_input_indexes() -> None:
     default = GatewayConfig.from_dict(
-        {"joint_order": [], "agent": {"action_manifests": []}}
+        {"joint_order": []}
     )
     assert default.tools.enabled is False
     assert default.tools.lease_ttl_ms == 15_000
@@ -259,7 +258,6 @@ def test_tools_defaults_and_runtime_input_indexes() -> None:
         assert runtime.tool_input_ids == frozenset(
             {"yolo/to_gateway", "caller/tool_request"}
         )
-        assert runtime.action_registry is not runtime.tool_gateway
     finally:
         runtime.close()
 
@@ -311,7 +309,6 @@ def test_tools_config_is_strict(tools: object, match: str) -> None:
         GatewayConfig.from_dict(
             {
                 "joint_order": [],
-                "agent": {"action_manifests": []},
                 "tools": tools,
             }
         )
@@ -322,7 +319,6 @@ def test_unmerged_tool_registry_key_has_no_backward_compatibility() -> None:
         GatewayConfig.from_dict(
             {
                 "joint_order": [],
-                "agent": {"action_manifests": []},
                 "tool_registry": {},
             }
         )
@@ -353,7 +349,6 @@ def test_tools_reject_reserved_gateway_ports(
         GatewayConfig.from_dict(
             {
                 "joint_order": [],
-                "agent": {"action_manifests": []},
                 "tools": tools,
             }
         )
@@ -365,7 +360,6 @@ def test_tools_reject_image_input_collision() -> None:
             {
                 "joint_order": [],
                 "image_input_ids": ["image/front"],
-                "agent": {"action_manifests": []},
                 "tools": {
                     "enabled": True,
                     "providers": [{**_provider(), "input_id": "image/front"}],
@@ -395,7 +389,6 @@ def test_tools_reject_duplicate_provider_or_public_ports(
         GatewayConfig.from_dict(
             {
                 "joint_order": [],
-                "agent": {"action_manifests": []},
                 "tools": tools,
             }
         )
@@ -1201,7 +1194,6 @@ def test_disabled_tools_do_not_reserve_default_or_configured_ports() -> None:
         {
             "joint_order": [],
             "image_input_ids": ["tool_request", "yolo/to_gateway"],
-            "agent": {"action_manifests": []},
             "tools": {
                 "enabled": False,
                 "request_input_id": "tick",

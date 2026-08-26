@@ -19,9 +19,6 @@ def test_policy_command_preserves_metadata_and_enforces_capacity() -> None:
         {"target": "apple"},
         request_id="request-1",
         policy_id="special-policy",
-        tracked_command_id="command-1",
-        retry_on_failure=True,
-        attempt=2,
     )
 
     with pytest.raises(CommandMailboxUnavailable, match="command mailbox is full"):
@@ -36,30 +33,10 @@ def test_policy_command_preserves_metadata_and_enforces_capacity() -> None:
         "request_id": "request-1",
         "policy_id": "special-policy",
     }
-    assert command.tracked_command_id == "command-1"
-    assert command.retry_on_failure is True
-    assert command.attempt == 2
     assert service.take_next_command() is None
 
 
-def test_safety_lane_bypasses_capacity_and_overtakes_normal_fifo() -> None:
-    service = _service(capacity=2)
-    service.enqueue_policy_command("normal-1")
-    service.enqueue_policy_command("normal-2")
-    service.enqueue_policy_command("safety-1", safety=True)
-    service.enqueue_policy_command("safety-2", safety=True)
-
-    commands = [service.take_next_command() for _ in range(4)]
-
-    assert [command.payload["command"] for command in commands if command is not None] == [
-        "safety-1",
-        "safety-2",
-        "normal-1",
-        "normal-2",
-    ]
-
-
-def test_block_is_idempotent_and_rejects_only_normal_admission() -> None:
+def test_block_is_idempotent_and_rejects_admission() -> None:
     service = _service()
 
     assert service.block_command_dispatch("unsafe") is True
@@ -73,12 +50,6 @@ def test_block_is_idempotent_and_rejects_only_normal_admission() -> None:
     ):
         service.enqueue_policy_command("normal")
 
-    service.enqueue_policy_command("stop", retry_on_failure=True, safety=True)
-    command = service.safety_command_queue.get_nowait()
-    assert command.payload["command"] == "stop"
-    assert command.retry_on_failure is True
-
-
 def test_close_rejects_all_admission_and_preserves_pending_work() -> None:
     service = _service()
     service.enqueue_policy_command("pending")
@@ -89,18 +60,16 @@ def test_close_rejects_all_admission_and_preserves_pending_work() -> None:
     assert service.command_dispatch_allowed() is False
     assert service.block_command_dispatch("unsafe") is False
 
-    for safety in (False, True):
-        with pytest.raises(
-            CommandMailboxUnavailable,
-            match="command mailbox is closed: runtime closing",
-        ):
-            service.enqueue_policy_command("rejected", safety=safety)
+    with pytest.raises(
+        CommandMailboxUnavailable,
+        match="command mailbox is closed: runtime closing",
+    ):
+        service.enqueue_policy_command("rejected")
     with pytest.raises(CommandMailboxUnavailable, match="command mailbox is closed"):
         service.set_record_root("/records")
 
     assert service.take_next_command() is None
     assert service.command_queue.qsize() == 1
-    assert service.safety_command_queue.empty()
 
 
 def test_take_rechecks_block_gate_without_dequeueing_pending_work() -> None:

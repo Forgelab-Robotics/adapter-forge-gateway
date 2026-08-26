@@ -17,7 +17,6 @@ class CommandService:
             raise ValueError("command mailbox capacity must be positive")
         self.default_policy_id = default_policy_id
         self.command_queue: queue.Queue[Command] = queue.Queue(maxsize=capacity)
-        self.safety_command_queue: queue.Queue[Command] = queue.Queue()
         self._lock = threading.Lock()
         self._dispatch_blocked_reason: str | None = None
         self._closed_reason: str | None = None
@@ -40,10 +39,6 @@ class CommandService:
         *,
         request_id: str = "",
         policy_id: str | None = None,
-        tracked_command_id: str | None = None,
-        retry_on_failure: bool = False,
-        attempt: int = 0,
-        safety: bool = False,
     ) -> None:
         outbound = Command(
             kind="POLICY_COMMAND",
@@ -53,11 +48,8 @@ class CommandService:
                 "request_id": request_id,
                 "policy_id": policy_id or self.default_policy_id,
             },
-            tracked_command_id=tracked_command_id,
-            retry_on_failure=retry_on_failure,
-            attempt=attempt,
         )
-        self._offer(outbound, safety=safety)
+        self._offer(outbound)
 
     def set_record_root(self, root: str | None) -> None:
         self._offer(Command(kind="SET_ROOT", payload={"root": root}))
@@ -67,12 +59,9 @@ class CommandService:
             if self._closed_reason is not None or self._dispatch_blocked_reason is not None:
                 return None
             try:
-                return self.safety_command_queue.get_nowait()
+                return self.command_queue.get_nowait()
             except queue.Empty:
-                try:
-                    return self.command_queue.get_nowait()
-                except queue.Empty:
-                    return None
+                return None
 
     def command_dispatch_allowed(self) -> bool:
         with self._lock:
@@ -97,19 +86,16 @@ class CommandService:
             self._dispatch_blocked_reason = reason
             return True
 
-    def _offer(self, command: Command, *, safety: bool = False) -> None:
+    def _offer(self, command: Command) -> None:
         with self._lock:
             if self._closed_reason is not None:
                 raise CommandMailboxUnavailable(
                     f"command mailbox is closed: {self._closed_reason}"
                 )
-            if self._dispatch_blocked_reason is not None and not safety:
+            if self._dispatch_blocked_reason is not None:
                 raise CommandMailboxUnavailable(
                     f"command dispatch is blocked: {self._dispatch_blocked_reason}"
                 )
-            if safety:
-                self.safety_command_queue.put_nowait(command)
-                return
             try:
                 self.command_queue.put_nowait(command)
             except queue.Full as error:
