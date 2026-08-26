@@ -485,8 +485,8 @@ class ToolGatewayService:
                 f"maximum {self.config.invoke_timeout_ms}"
             )
         spec, registration = self.resolve_tool_spec(tool_id, now=observation)
-        if spec.semantics != "action":
-            raise ValueError(f"ToolSpec {tool_id!r} is not an Action")
+        if spec.semantics not in ("action", "session"):
+            raise ValueError(f"ToolSpec {tool_id!r} is not an Action or Session")
         operation_descriptor = next(
             item
             for item in registration.descriptor.operations
@@ -495,9 +495,17 @@ class ToolGatewayService:
         identity = uuid.uuid4().hex
         invocation_id = f"gateway-{identity}"
         attempt_id = f"gateway-{identity}"
-        deadline_ms = min(
-            _MAX_SAFE_JSON_INTEGER,
-            int(time.time() * 1_000) + effective_timeout,
+        # Session invocations are unbounded by design: deadline machinery
+        # (mark_deadlines_ambiguous) must never pin them to `unknown`.
+        # The bounded handshake exchange below keeps its own timeout, and
+        # provider death mid-session is caught by lease-expiry ambiguity.
+        deadline_ms = (
+            None
+            if spec.semantics == "session"
+            else min(
+                _MAX_SAFE_JSON_INTEGER,
+                int(time.time() * 1_000) + effective_timeout,
+            )
         )
         context = ToolContext(
             execution_key=ToolExecutionKey(invocation_id, attempt_id),
@@ -658,6 +666,82 @@ class ToolGatewayService:
             except BaseException:
                 self._release_outbound_slots_locked()
                 self.action_invocations.set_cancel_status(key, "transport_error")
+                raise
+        return "requested"
+
+    def stop_action(self, invocation_id: str, *, now: float | None = None) -> str:
+        """Request provider stop; acceptance never implies termination."""
+        observation = time.monotonic() if now is None else self._validate_now(now)
+        with self._lock:
+            key = self._http_action_key(invocation_id, now=observation)
+            if key is None:
+                raise KeyError(invocation_id)
+            item = self.action_invocations.get(key, now=observation)
+            if item is None:
+                raise KeyError(invocation_id)
+            if item.phase in TERMINAL_PHASES:
+                return "terminal"
+            if item.stop_status in (
+                "requested",
+                "accepted",
+                "terminal",
+                "unsupported",
+            ):
+                return item.stop_status
+            if any(
+                exchange.execution_key == key and exchange.purpose == "stop"
+                for exchange in self._action_exchanges.values()
+            ):
+                return item.stop_status or "requested"
+            expired = self._directory.expire(observation)
+            self._finish_unclaimed_for_removed_locked(
+                expired, observed_at=observation
+            )
+            registration = self._directory.resolve(
+                item.endpoint_id, item.operation, now=observation
+            )
+            if (
+                registration is None
+                or registration.endpoint_instance_id != item.endpoint_instance_id
+            ):
+                self.action_invocations.mark_instance_ambiguous(
+                    item.endpoint_id,
+                    item.endpoint_instance_id,
+                    now=observation,
+                    reason="pinned provider instance is no longer current",
+                )
+                return "unknown"
+            operation = next(
+                entry
+                for entry in registration.descriptor.operations
+                if entry.name == item.operation
+            )
+            if not operation.stoppable:
+                return "unsupported"
+            request = ToolEnvelope(
+                protocol=TOOL_ENDPOINT_PROTOCOL,
+                message_type="tool.control.request",
+                request_id=f"gateway-provider-{uuid.uuid4().hex}",
+                invocation_id=item.invocation_id,
+                attempt_id=item.attempt_id,
+                endpoint_id=item.endpoint_id,
+                endpoint_instance_id=item.endpoint_instance_id,
+                operation=item.operation,
+                payload={"command": "stop"},
+            )
+            self._reserve_outbound_slots_locked()
+            try:
+                self.action_invocations.set_stop_status(key, "requested")
+                self._queue_action_exchange_locked(
+                    key,
+                    request,
+                    registration.route,
+                    purpose="stop",
+                    deadline=observation + self.config.invoke_timeout_ms / 1_000,
+                )
+            except BaseException:
+                self._release_outbound_slots_locked()
+                self.action_invocations.set_stop_status(key, "transport_error")
                 raise
         return "requested"
 
@@ -972,7 +1056,7 @@ class ToolGatewayService:
         )
         if (
             operation_descriptor is not None
-            and operation_descriptor.semantics == "action"
+            and operation_descriptor.semantics in ("action", "session")
         ):
             self._admit_dora_action_locked(
                 request, context, registration, processed_at=processed_at
@@ -1006,10 +1090,11 @@ class ToolGatewayService:
                 spec.implementation_id != context.implementation_id
                 or spec.endpoint_id != context.endpoint_id
                 or spec.operation != context.operation
-                or spec.semantics != "action"
+                or spec.semantics not in ("action", "session")
             ):
                 raise ValueError(
-                    "Dora Action context does not exactly match its configured ToolSpec"
+                    "Dora Action or Session context does not exactly match its "
+                    "configured ToolSpec"
                 )
             self.catalog.validate_binding(spec, registration)
             provider_request = make_invoke_request_envelope(
@@ -1221,7 +1306,7 @@ class ToolGatewayService:
                 request,
                 self._tool_error(
                     "FORGE_TOOL_GATEWAY_BUSY",
-                    f"an Action {command} request is already pending",
+                    f"an Action or Session {command} request is already pending",
                     retryable=True,
                 ),
             )
@@ -1244,6 +1329,8 @@ class ToolGatewayService:
             provider_reserved = True
             if command == "cancel":
                 self.action_invocations.set_cancel_status(key, "requested")
+            elif command == "stop":
+                self.action_invocations.set_stop_status(key, "requested")
             self._queue_action_exchange_locked(
                 key,
                 provider_request,
@@ -1259,6 +1346,8 @@ class ToolGatewayService:
                 self._release_outbound_slots_locked()
             if command == "cancel":
                 self.action_invocations.set_cancel_status(key, "transport_error")
+            elif command == "stop":
+                self.action_invocations.set_stop_status(key, "transport_error")
             self._append_reserved_outbound_locked(
                 ToolOutboundMessage(
                     output_id=self.config.response_output_id,
@@ -1713,6 +1802,10 @@ class ToolGatewayService:
             control = control_response_from_payload(response.payload)
             if control.command == "cancel":
                 self.action_invocations.set_cancel_status(
+                    execution_key, control.status
+                )
+            elif control.command == "stop":
+                self.action_invocations.set_stop_status(
                     execution_key, control.status
                 )
 

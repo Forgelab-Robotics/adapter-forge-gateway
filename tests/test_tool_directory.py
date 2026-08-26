@@ -169,7 +169,7 @@ def test_different_route_cannot_replace_current() -> None:
     assert directory.revision == 1
 
 
-def test_register_rejects_route_mismatch_and_session_but_accepts_action() -> None:
+def test_register_accepts_action_and_session_but_rejects_unknown_semantics() -> None:
     directory = EndpointDirectory()
 
     unauthorized = directory.register(
@@ -182,7 +182,7 @@ def test_register_rejects_route_mismatch_and_session_but_accepts_action() -> Non
         route(),
         now=2.0,
     )
-    unsupported = directory.register(
+    session = directory.register(
         registration(
             semantics="session",
             instance_id="instance-session",
@@ -196,10 +196,11 @@ def test_register_rejects_route_mismatch_and_session_but_accepts_action() -> Non
     assert unauthorized.error is not None
     assert unauthorized.error.code == "FORGE_ENDPOINT_ROUTE_UNAUTHORIZED"
     assert action.status == "accepted"
-    assert unsupported.status == "rejected"
-    assert unsupported.error is not None
-    assert unsupported.error.code == "FORGE_TOOL_SEMANTICS_UNSUPPORTED"
-    assert directory.revision == 1
+    assert session.status == "accepted"
+    assert directory.revision == 2
+
+    with pytest.raises(ValueError, match="semantics"):
+        ToolOperationDescriptor(name="detect", semantics="stream")  # type: ignore[arg-type]
 
 
 def test_matching_unregister_removes_and_absent_unregister_is_effect_idempotent() -> (

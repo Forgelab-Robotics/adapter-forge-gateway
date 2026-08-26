@@ -95,8 +95,8 @@ class ToolSpec:
     def __post_init__(self) -> None:
         for name in ("tool_id", "implementation_id", "endpoint_id", "operation"):
             _non_blank(getattr(self, name), name)
-        if self.semantics not in ("query", "action"):
-            raise ValueError("ToolSpec semantics must be query or action")
+        if self.semantics not in ("query", "action", "session"):
+            raise ValueError("ToolSpec semantics must be query, action, or session")
         if not isinstance(self.description, str):
             raise TypeError("description must be a string")
         if not isinstance(self.input_schema, Mapping) or not isinstance(

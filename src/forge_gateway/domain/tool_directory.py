@@ -221,7 +221,7 @@ class EndpointDirectory:
             if (
                 descriptor.endpoint_id == route.endpoint_id
                 and all(
-                    operation.semantics in ("query", "action")
+                    operation.semantics in ("query", "action", "session")
                     for operation in descriptor.operations
                 )
                 and (
@@ -246,15 +246,15 @@ class EndpointDirectory:
                     removed=expired,
                 )
             if any(
-                operation.semantics not in ("query", "action")
+                operation.semantics not in ("query", "action", "session")
                 for operation in descriptor.operations
             ):
                 return EndpointDirectoryMutation(
                     response=self._rejected(
                         "register",
                         "FORGE_TOOL_SEMANTICS_UNSUPPORTED",
-                        "Gateway Tool providers may register Query or Action "
-                        "operations only",
+                        "Gateway Tool providers may register Query, Action, or "
+                        "Session operations only",
                     ),
                     removed=expired,
                 )
