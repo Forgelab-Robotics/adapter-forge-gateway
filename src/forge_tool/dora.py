@@ -7,7 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 
 import pyarrow as pa
-from ._tool_message import ToolMessage, ToolMessageSizeError
+from forge_msgs import ToolMessage, ToolMessageSizeError
 
 from .endpoint import ToolError
 from .handler import ToolEndpointHandler
@@ -119,7 +119,7 @@ def tool_message_to_envelope(
 ) -> ToolEnvelope:
     """Convert one carrier model and enforce the logical encoded-message limit."""
     if not isinstance(message, ToolMessage):
-        raise TypeError("message must be a ToolMessage")
+        raise TypeError("message must be a forge_msgs.ToolMessage")
     maximum = _validate_maximum(max_message_bytes, "max_message_bytes")
     envelope = _message_envelope(message)
     _validate_envelope_size(envelope, maximum)

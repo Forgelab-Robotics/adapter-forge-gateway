@@ -28,7 +28,7 @@ dependency graph.
 - Upstream project identity: public `Forgelab-Robotics/forge`. Its current
   public branches do not contain `packages/tool`.
 - Source used: a local Forge workspace snapshot identified by
-  `8c32b03403518c4b3c6aeb3f834c726d06dd3c1c`
+  `2f3dac8a8ccd33472109d2b763e6d3bd86e091e5`
 - Original source path: `packages/tool/src/forge_tool`
 - Vendored path: `src/forge_tool`
 - License: Apache License 2.0
@@ -41,18 +41,12 @@ The snapshot identifier records the provenance of the local source used here;
 it does not imply that `packages/tool` can be retrieved from the current public
 repository at that identifier.
 
-## Vendored ToolMessage Arrow carrier
+## ToolMessage Arrow carrier
 
-- Component: the `ToolMessage` Arrow carrier subset of `forge-msgs`
-- Source used: the same local Forge workspace snapshot identified by
-  `8c32b03403518c4b3c6aeb3f834c726d06dd3c1c`
-- Original source path: `packages/msgs/src/forge_msgs/tool.py`
-- Vendored path: `src/forge_tool/_tool_message.py`
+- Component: the `ToolMessage` Arrow carrier of `forge-msgs`
+- Previously vendored as `src/forge_tool/_tool_message.py`; now provided by the
+  public `forge-msgs==1.3.0` dependency instead of a local copy.
 - License: Apache License 2.0
-- Modifications: only this carrier module is redistributed. Its
-  `ensure_record_batch` dependency was reduced to a local helper supporting the
-  carrier's accepted in-memory Arrow types, so no local package shadows or
-  impersonates the public `forge_msgs` distribution.
 
 ## Build dependencies and binary releases
 

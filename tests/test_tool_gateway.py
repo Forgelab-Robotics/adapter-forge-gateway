@@ -52,7 +52,7 @@ from forge_tool import (
     validate_management_response_correlation,
     validate_response_correlation,
 )
-from forge_tool._tool_message import ToolMessage
+from forge_msgs import ToolMessage
 from forge_tool.dora import tool_envelope_to_message, tool_message_to_envelope
 
 from forge_gateway import cli
