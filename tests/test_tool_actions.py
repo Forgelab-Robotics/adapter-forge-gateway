@@ -495,6 +495,95 @@ def test_observation_exchange_failure_does_not_make_execution_unknown() -> None:
         runtime.close()
 
 
+def test_http_action_capacity_rejection_returns_structured_busy_error() -> None:
+    runtime = GatewayRuntime(_config())
+    try:
+        _register(runtime, max_concurrency=1)
+        runtime.tool_gateway.submit_http_action("robot.pick", {})
+        assert runtime.tool_gateway.take_outbound() is not None
+        app = FastAPI()
+        register_tool_routes(app, runtime)
+
+        response = TestClient(app).post(
+            "/tools/robot.pick:invoke",
+            json={"arguments": {}},
+        )
+
+        assert response.status_code == 503
+        assert response.json()["msg"]
+        assert response.json()["error"]["code"] == "FORGE_TOOL_GATEWAY_BUSY"
+        assert response.json()["error"]["retryable"] is True
+    finally:
+        runtime.close()
+
+
+def test_http_operation_alias_action_rejection_returns_structured_busy_error() -> None:
+    runtime = GatewayRuntime(_config())
+    try:
+        _register(runtime, max_concurrency=1)
+        runtime.tool_gateway.submit_http_action("robot.pick", {})
+        assert runtime.tool_gateway.take_outbound() is not None
+        app = FastAPI()
+        register_tool_routes(app, runtime)
+
+        response = TestClient(app).post(
+            "/tools/robot.arm/pick:invoke",
+            json={"arguments": {}},
+        )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "FORGE_TOOL_GATEWAY_BUSY"
+        assert response.json()["error"]["retryable"] is True
+    finally:
+        runtime.close()
+
+
+def test_http_action_without_active_instance_returns_structured_admission_error() -> None:
+    runtime = GatewayRuntime(_config())
+    try:
+        app = FastAPI()
+        register_tool_routes(app, runtime)
+
+        response = TestClient(app).post(
+            "/tools/robot.pick:invoke",
+            json={"arguments": {}},
+        )
+
+        assert response.status_code == 503
+        assert (
+            response.json()["error"]["code"]
+            == "FORGE_TOOL_ACTION_ADMISSION_REJECTED"
+        )
+        assert response.json()["error"]["retryable"] is True
+    finally:
+        runtime.close()
+
+
+def test_http_action_unclassified_runtime_error_stays_unstructured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = GatewayRuntime(_config())
+    try:
+        def fail(*_: object, **__: object) -> dict[str, object]:
+            raise RuntimeError("lifecycle thread stopped responding")
+
+        monkeypatch.setattr(runtime.tool_gateway, "submit_http_action", fail)
+        app = FastAPI()
+        register_tool_routes(app, runtime)
+
+        response = TestClient(app).post(
+            "/tools/robot.pick:invoke",
+            json={"arguments": {}},
+        )
+
+        # Without proof that nothing was dispatched, the caller must not see a
+        # code that would license resending the same invocation.
+        assert response.status_code == 503
+        assert "error" not in response.json()
+    finally:
+        runtime.close()
+
+
 def test_deadline_unknown_keeps_concurrency_until_instance_isolated() -> None:
     runtime = GatewayRuntime(_config())
     try:

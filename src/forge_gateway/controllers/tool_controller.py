@@ -13,9 +13,39 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from forge_tool import ToolError
 
 from forge_gateway.controllers.utils import json_response, read_json
-from forge_gateway.services.tool_gateway_service import tool_error_from_response
+from forge_gateway.domain.action_invocations import ActionInvocationCapacityError
+from forge_gateway.services.tool_gateway_service import (
+    ToolGatewayMailboxFull,
+    ToolGatewayUnavailable,
+    tool_error_from_response,
+)
 
 _INVOKE_BODY_KEYS = frozenset(("arguments", "caller_id", "timeout_ms"))
+
+
+def _admission_error(error: RuntimeError) -> dict[str, Any] | None:
+    """Map a synchronous Action admission rejection to a structured error.
+
+    Action admission rejections mean the invoke never reached a provider, so
+    they mirror the codes the Dora action path already emits and are safe to
+    retry. Any other RuntimeError stays unstructured: without proof that
+    nothing was dispatched, a caller must not resend.
+    """
+    if isinstance(error, (ActionInvocationCapacityError, ToolGatewayMailboxFull)):
+        code = "FORGE_TOOL_GATEWAY_BUSY"
+    elif isinstance(error, ToolGatewayUnavailable):
+        code = "FORGE_TOOL_ACTION_ADMISSION_REJECTED"
+    else:
+        return None
+    return {"code": code, "message": str(error), "retryable": True, "details": {}}
+
+
+def _runtime_error_response(error: RuntimeError) -> JSONResponse:
+    payload: dict[str, Any] = {"ok": False, "msg": str(error)}
+    structured = _admission_error(error)
+    if structured is not None:
+        payload["error"] = structured
+    return json_response(503, payload)
 
 
 def _error_payload(error: ToolError) -> dict[str, Any]:
@@ -41,6 +71,7 @@ def _status_for_tool_error(error: ToolError) -> int:
         "FORGE_TOOL_ENDPOINT_UNAVAILABLE",
         "FORGE_TOOL_GATEWAY_BUSY",
         "FORGE_TOOL_GATEWAY_UNAVAILABLE",
+        "FORGE_TOOL_ACTION_ADMISSION_REJECTED",
         "FORGE_TOOL_TRANSPORT_UNAVAILABLE",
     ):
         return 503
@@ -165,7 +196,7 @@ def register_tool_routes(app: FastAPI, runtime: Any) -> None:
         except ValueError as error:
             return json_response(400, {"ok": False, "msg": str(error)})
         except RuntimeError as error:
-            return json_response(503, {"ok": False, "msg": str(error)})
+            return _runtime_error_response(error)
         return json_response(202, {"ok": True, "data": invocation})
 
     app.add_api_route("/tools/{tool_id}:invoke", _action_invoke, methods=["POST"])
@@ -270,7 +301,7 @@ def register_tool_routes(app: FastAPI, runtime: Any) -> None:
         except ValueError as error:
             return json_response(400, {"ok": False, "msg": str(error)})
         except RuntimeError as error:
-            return json_response(503, {"ok": False, "msg": str(error)})
+            return _runtime_error_response(error)
 
         wrapped = asyncio.wrap_future(ticket.future)
         try:

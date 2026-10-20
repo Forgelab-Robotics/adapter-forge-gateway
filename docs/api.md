@@ -71,6 +71,31 @@ HTTP 输出不包含 provider-pinned `endpoint_instance_id`。HTTP handler 使�
 
 如果 endpoint operation 是 Action，则必须存在 semantics 一致的 ToolSpec binding，接口立即返回 `202` invocation resource，不等待执行完成。
 
+### Action 拒绝的结构化错误（自 1.1.2 起）
+
+两条 Action 路由（`POST /tools/{tool_id}:invoke` 与 `POST /tools/{endpoint_id}/{operation}:invoke`）在 admission 阶段同步拒绝时，除保留原有 `msg` 外还会返回 `error` 对象：
+
+```json
+{
+  "ok": false,
+  "msg": "operation pick concurrency 1 is exhausted",
+  "error": {
+    "code": "FORGE_TOOL_GATEWAY_BUSY",
+    "message": "operation pick concurrency 1 is exhausted",
+    "retryable": true,
+    "details": {}
+  }
+}
+```
+
+- `FORGE_TOOL_GATEWAY_BUSY`（`retryable: true`）：operation concurrency 已满，或 Tool outbound mailbox 无剩余 slot。
+- `FORGE_TOOL_ACTION_ADMISSION_REJECTED`（`retryable: true`）：Gateway 正在关闭、endpoint 当前无 active instance，或 admission 期间 provider instance 被替换。
+
+两种 code 都表示 invoke 从未到达 provider，调用方可以安全地用相同参数重发。其他 `503`（例如未分类的内部 `RuntimeError`）不携带 `error`，调用方不得据此重发。
+
+兼容性：1.1.1 及更早版本的 Action 路由对所有 admission 异常只返回 `503 {"ok": false, "msg": ...}`，没有 `error.code`；调用方应把这类响应视为结果未知。结构化契约从 1.1.2 开始提供，两者在响应形状上向后兼容（新增字段，不删改 `msg`）。
+
+
 ### ToolSpec 与 Action invocation
 
 - `GET /tools/{tool_id}`：返回配置 ToolSpec。
