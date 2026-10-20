@@ -913,3 +913,134 @@ def test_query_unknown_operation_returns_404_instead_of_500() -> None:
         assert response.status_code == 404
     finally:
         runtime.close()
+
+
+def test_deadline_unknown_releases_concurrency_on_late_terminal_event() -> None:
+    runtime = GatewayRuntime(_config())
+    try:
+        _register(runtime, max_concurrency=1)
+        created = runtime.tool_gateway.submit_http_action("robot.pick", {})
+        provider_invoke = runtime.tool_gateway.take_outbound()
+        assert provider_invoke is not None
+        _, provider_context = invoke_request_from_envelope(provider_invoke.envelope)
+        runtime.tool_gateway.handle_input(
+            "arm/to_gateway",
+            make_invoke_response_envelope(ToolAccepted(), provider_invoke.envelope),
+            received_at=time.monotonic(),
+        )
+        item = runtime.tool_gateway.action_invocations.get(
+            (created["invocation_id"], created["attempt_id"]),
+            now=time.monotonic(),
+        )
+        assert item is not None and item.deadline_ms is not None
+        runtime.tool_gateway.action_invocations.mark_deadlines_ambiguous(
+            now=time.monotonic(), epoch_ms=item.deadline_ms
+        )
+        with pytest.raises(ActionInvocationCapacityError):
+            runtime.tool_gateway.submit_http_action("robot.pick", {})
+
+        # The provider finishes after the deadline closed the attempt: the
+        # late terminal event must release the concurrency fence...
+        runtime.tool_gateway.handle_input(
+            "arm/to_gateway",
+            make_event_envelope(
+                ToolEvent(type="executor_completed", data={"final": True}),
+                provider_context,
+                endpoint_instance_id="arm-instance-1",
+                sequence=0,
+            ),
+            received_at=time.monotonic(),
+        )
+        replacement = runtime.tool_gateway.submit_http_action("robot.pick", {})
+        assert replacement["phase"] == "dispatching"
+
+        # ...and the terminal event must trigger the retained-result lookup,
+        # whose reply reconciles the closed-unknown attempt to its outcome.
+        result_request = runtime.tool_gateway.take_outbound()
+        while result_request is not None and (
+            result_request.envelope.message_type != "tool.result.request"
+        ):
+            result_request = runtime.tool_gateway.take_outbound()
+        assert result_request is not None
+        runtime.tool_gateway.handle_input(
+            "arm/to_gateway",
+            make_result_response_envelope(
+                ToolResultResponse(
+                    status="available",
+                    result=ToolResult(
+                        status="succeeded", outputs={"final_positions": [0.5]}
+                    ),
+                ),
+                result_request.envelope,
+            ),
+            received_at=time.monotonic(),
+        )
+        snapshot = runtime.tool_gateway.action_invocation_snapshot(
+            created["invocation_id"]
+        )
+        assert snapshot is not None
+        assert snapshot["phase"] == "completed"
+        assert snapshot["result"]["outputs"] == {"final_positions": [0.5]}
+    finally:
+        runtime.close()
+
+
+def test_cancel_action_on_deadline_unknown_forwards_to_provider() -> None:
+    runtime = GatewayRuntime(_config())
+    try:
+        _register(runtime, max_concurrency=1)
+        created = runtime.tool_gateway.submit_http_action("robot.pick", {})
+        provider_invoke = runtime.tool_gateway.take_outbound()
+        assert provider_invoke is not None
+        _, provider_context = invoke_request_from_envelope(provider_invoke.envelope)
+        runtime.tool_gateway.handle_input(
+            "arm/to_gateway",
+            make_invoke_response_envelope(ToolAccepted(), provider_invoke.envelope),
+            received_at=time.monotonic(),
+        )
+        item = runtime.tool_gateway.action_invocations.get(
+            (created["invocation_id"], created["attempt_id"]),
+            now=time.monotonic(),
+        )
+        assert item is not None and item.deadline_ms is not None
+        runtime.tool_gateway.action_invocations.mark_deadlines_ambiguous(
+            now=time.monotonic(), epoch_ms=item.deadline_ms
+        )
+
+        # A deadline-unknown attempt still fences concurrency because the
+        # provider keeps executing: cancelling it must forward to the provider
+        # instead of short-circuiting as "terminal".
+        assert (
+            runtime.tool_gateway.cancel_action(created["invocation_id"])
+            == "requested"
+        )
+        control = runtime.tool_gateway.take_outbound()
+        assert control is not None
+        assert control.envelope.message_type == "tool.control.request"
+        runtime.tool_gateway.handle_input(
+            "arm/to_gateway",
+            make_control_response_envelope(
+                ToolControlResponse(command="cancel", status="accepted"),
+                control.envelope,
+            ),
+            received_at=time.monotonic(),
+        )
+        with pytest.raises(ActionInvocationCapacityError):
+            runtime.tool_gateway.submit_http_action("robot.pick", {})
+
+        # Provider confirms termination with the cancelled terminal event,
+        # which releases the fence.
+        runtime.tool_gateway.handle_input(
+            "arm/to_gateway",
+            make_event_envelope(
+                ToolEvent(type="cancelled", data={}),
+                provider_context,
+                endpoint_instance_id="arm-instance-1",
+                sequence=0,
+            ),
+            received_at=time.monotonic(),
+        )
+        replacement = runtime.tool_gateway.submit_http_action("robot.pick", {})
+        assert replacement["phase"] == "dispatching"
+    finally:
+        runtime.close()
