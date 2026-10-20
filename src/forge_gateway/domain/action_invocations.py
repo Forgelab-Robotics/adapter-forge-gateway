@@ -201,7 +201,13 @@ class ActionInvocationStore:
     ) -> bool:
         with self._changed:
             item = self._items.get(key)
-            if item is None or item.phase in TERMINAL_PHASES:
+            if item is None:
+                return False
+            if item.phase in TERMINAL_PHASES and item.phase != "unknown":
+                return False
+            if item.phase == "unknown" and phase not in TERMINAL_PHASES:
+                # Only a late terminal outcome may reconcile a closed-unknown
+                # item; it can never reopen into a nonterminal phase.
                 return False
             if phase in TERMINAL_PHASES:
                 if result is None:
@@ -279,7 +285,9 @@ class ActionInvocationStore:
     ) -> bool:
         with self._changed:
             item = self._items.get(key)
-            if item is None or item.phase in TERMINAL_PHASES:
+            if item is None:
+                return False
+            if item.phase in TERMINAL_PHASES and item.phase != "unknown":
                 return False
             if item.terminal_event_seen:
                 raise ValueError("provider event arrived after a terminal event")
@@ -288,6 +296,12 @@ class ActionInvocationStore:
             item.last_provider_sequence = provider_sequence
             if event.type in _TERMINAL_EVENTS:
                 item.terminal_event_seen = True
+                if item.phase == "unknown":
+                    # The provider finished an execution the deadline already
+                    # closed as unknown: the terminal event proves the
+                    # execution is over, so the concurrency fence can go even
+                    # before the retained result arrives.
+                    item.occupies_concurrency = False
             item.events.append(
                 ActionInvocationEvent(
                     sequence=item.next_event_sequence,

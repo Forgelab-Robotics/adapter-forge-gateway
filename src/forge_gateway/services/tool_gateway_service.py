@@ -603,7 +603,11 @@ class ToolGatewayService:
             item = self.action_invocations.get(key, now=observation)
             if item is None:
                 raise KeyError(invocation_id)
-            if item.phase in TERMINAL_PHASES:
+            if item.phase in TERMINAL_PHASES and not (
+                item.phase == "unknown"
+                and item.occupies_concurrency
+                and not item.terminal_event_seen
+            ):
                 return "terminal"
             if item.cancel_status in (
                 "requested",
