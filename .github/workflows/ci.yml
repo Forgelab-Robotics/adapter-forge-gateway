@@ -25,7 +25,8 @@ jobs:
       - name: Verify CLI
         run: |
           uv run python main.py --help
-          test "$(uv run python main.py --version)" = "forge-gateway 1.0.2"
+          expected="forge-gateway $(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$(uv run python main.py --version)" = "$expected"
       - name: Import Forge packages
         run: PYTHONPATH=src uv run python -c "import forge_common, forge_msgs, forge_tool"
       - name: License and public-tree checks
