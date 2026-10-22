@@ -1,64 +1,111 @@
 # Forge Gateway
 
-`gateway` 是统一的运行时入口，提供本地 HTTP 控制 API、runtime readiness/start gate，以及状态/图像 WebSocket。
+[English](README.md) | [简体中文](README_zh.md)
 
-本项目是 Forge Gateway 的独立开源仓库，由 Forge Runtime 中的 Gateway
-节点演进而来。完整接口说明见本项目的 [Gateway API 文档](docs/api.md)，
-安全部署边界见 [SECURITY.md](SECURITY.md)，发布检查记录见
-[OPEN_SOURCE_AUDIT.md](OPEN_SOURCE_AUDIT.md)。
+`gateway` is the unified runtime entrypoint for local HTTP control, runtime readiness/start gates, and state/image WebSockets.
+
+This standalone open-source repository evolved from the Forge Runtime Gateway Node.
+See the [Gateway API guide](docs/api.md) for complete interfaces,
+[SECURITY.md](SECURITY.md) for deployment boundaries, and
+[OPEN_SOURCE_AUDIT.md](OPEN_SOURCE_AUDIT.md) for the release review.
 
 > [!WARNING]
-> Gateway 的控制接口不内置身份认证或 TLS。默认仅监听 `127.0.0.1`；
-> 如需远程访问，必须放在可信网络和经过认证的加密反向代理之后。连接真机前，
-> 还必须独立验证急停、工作区隔离和设备安全限制。
+> Gateway control APIs have no built-in authentication or TLS and listen on `127.0.0.1` by default.
+> Remote access requires a trusted network and an authenticated, encrypted reverse proxy.
+> Independently verify emergency stops, workspace isolation and device safety limits before connecting hardware.
 
-## 独立开发
+## Node, Endpoint and Tool API
 
-项目固定使用 Python `3.12`，依赖与开发/构建工具均由 `uv` 管理。
+| Item | Current implementation |
+| --- | --- |
+| Production Nodes | 1: `gateway`; source entrypoint `main.py`, packaged entrypoint `dist/gateway`; no standalone console script |
+| Tool support | Caller-visible discovery, ToolSpec, provider leases/routing, and Query/Action/Session invocation |
+| Own business Endpoints | 0; Gateway does not implement motion/gripper/benchmark business providers |
+| Routed Endpoints / operations | Defined by `tools.providers`, provider descriptors and current leases; no repository-fixed count |
+| Gateway Tools | Defined by `tools.specs`; availability also depends on provider registration/readiness and cannot be inferred from Node or Endpoint count |
+| Direct HTTP Tool API | 10 Tool/Invocation route templates below; excludes other runtime/record/playback/WebSocket interfaces |
 
-同步全部依赖组：
+| Method | Route template | Purpose |
+| --- | --- | --- |
+| GET | `/tools` | Tool catalog/discovery |
+| GET | `/tools/{tool_id}` | ToolSpec |
+| GET | `/tools/{tool_id}/context` | Readiness and frame context |
+| POST | `/tools/{tool_id}:invoke` | Create Action or Session invocation |
+| POST | `/tools/{endpoint_id}/{operation}:invoke` | Invoke Query |
+| GET | `/invocations/{invocation_id}` | Status |
+| GET | `/invocations/{invocation_id}/result` | Result |
+| POST | `/invocations/{invocation_id}/cancel` | Cancel Action |
+| POST | `/invocations/{invocation_id}/stop` | Stop Session |
+| GET | `/invocations/{invocation_id}/events` | SSE events |
+
+For example, robot-control-sim routes:
+`sim.set_gripper_opening -> gripper.controller / set_opening -> gripper_action_policy`.
+ToolSpec selects the business operation; the provider route selects Dora channels.
+Node IDs, Endpoint IDs and Tool IDs are separate identities.
+
+Current source supports Query, Action and Session, with Session start/stop/status/result handled separately from Action cancel.
+This does not establish equivalent capability in a historical Release or Skill-locked binary. Check deployment revisions first.
+Implementation: [HTTP routes](src/forge_gateway/controllers/tool_controller.py),
+[Tool service](src/forge_gateway/services/tool_gateway_service.py),
+[Session lifecycle tests](tests/test_tool_session.py).
+
+Compatibility: current dependency declarations are `dora-rs==0.4.1`, `forge-msgs==1.3.0`, `forge-common>=1.0.0,<2`. See [pyproject.toml](pyproject.toml) and [uv.lock](uv.lock). The Tool protocol implementation is vendored in this repository. These declarations do not guarantee cross-version interoperability; also check the build revision and Skill lock when using artifacts.
+
+Changes to Node entrypoints, Endpoints or Tool APIs must update this section and the associated configuration/contracts. Follow the [Node README contract](https://github.com/PhyAgentOS/forge/blob/master/CONTRIBUTING.md#node-readme-contract).
+
+## Standalone development
+
+The project uses Python `3.12`; `uv` manages dependencies and development/build tools.
+
+Synchronize all dependency groups:
 
 ```bash
 uv sync --frozen --all-groups
 ```
 
-运行测试：
+Run tests:
 
 ```bash
 uv run pytest -q
 ```
 
-从源码启动并检查帮助信息：
+Start from source and inspect the CLI:
 
 ```bash
 uv run python main.py --config config.example.yaml
 uv run python main.py --help
-uv run python main.py --version  # forge-gateway 1.0.2
+uv run python main.py --version
 ```
 
-这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。依赖通过公开索引锁定；尚未独立发布的 Apache-2.0 `forge-tool` 协议实现随源码仓库提供，以保证公开 checkout 可复现运行。普通 `pip install .` 不属于受支持的部署路径。
+This Node runs directly from a checkout. It neither builds/publishes a wheel or sdist nor installs a console script.
+`pyproject.toml` and `uv.lock` manage Python and dependencies; root `main.py` is the Node entrypoint,
+and `config.py` preserves historical source-import compatibility. Dependencies are locked against public indexes.
+The Apache-2.0 `forge-tool` protocol implementation is vendored to make the public checkout reproducible before
+its independent publication. Plain `pip install .` is not a supported deployment path.
 
-构建独立可执行文件：
+Build a standalone executable:
 
 ```bash
 ./scripts/build_pyinstaller.sh
 ```
 
-构建脚本使用临时 `.venv_build` 环境，将产物写入 `dist/gateway`，并在完成后执行 `dist/gateway --help` 与 `dist/gateway --version` 验证入口和版本。
+The build script uses a temporary `.venv_build`, writes `dist/gateway`, and verifies its entrypoint/version
+with `dist/gateway --help` and `dist/gateway --version`.
 
-## 应用生命周期
+## Application lifecycle
 
-`GatewayApplication` 统一管理 Runtime、Dora reader、launcher watcher 和 Uvicorn：
+`GatewayApplication` manages Runtime, the Dora reader, launcher watcher and Uvicorn:
 
-- Dora Node/runner 在 HTTP 端口开放前完成初始化。
-- Uvicorn 必须完成端口绑定 handshake；端口占用或后台线程提前退出会触发启动回滚。
-- `SIGINT`、`SIGTERM`、launcher 消失和 `/runtime/stop` 都进入同一 shutdown 路径。
-- shutdown 首先关闭 command/image admission，再停止 HTTP/Dora ingress，最后执行 Runtime close barrier。
-- cleanup 会尝试所有已获取的组件；超时或异常通过结构化结果返回，未完成的 close 可以重试。
+- Initialize the Dora Node/runner before opening HTTP ingress.
+- Uvicorn must complete its port-binding handshake; port conflicts or early background-thread exit roll startup back.
+- `SIGINT`, `SIGTERM`, launcher disappearance and `/runtime/stop` share one shutdown path.
+- Shutdown closes command/image admission, stops HTTP/Dora ingress, then executes the Runtime close barrier.
+- Cleanup attempts every acquired component; timeouts/errors produce structured results, and incomplete close can be retried.
 
-线程 join 使用统一的 application budget；Runtime 自身仍使用独立的 dispatch/image cleanup budget。如果底层 Dora iterator 永久阻塞，Gateway 会报告 shutdown incomplete 并以非零状态退出，而不会把它误报为正常关闭。
+Thread joins share an application budget; Runtime retains separate dispatch/image cleanup budgets.
+If a Dora iterator blocks indefinitely, Gateway reports incomplete shutdown and exits nonzero instead of reporting a clean close.
 
-## 配置
+## Configuration
 
 ```yaml
 host: 127.0.0.1
@@ -78,13 +125,13 @@ readiness:
   require_images: true
   require_state_client: false
   require_image_client: false
-  proprio_stale_after_sec: 2.0  # 设为 null 可显式使用旧的 presence-only 行为
+  proprio_stale_after_sec: 2.0  # null explicitly restores legacy presence-only behavior
   image_stale_after_sec: 2.0
 
 tools:
   enabled: false
   lease_ttl_ms: 15000
-  invoke_timeout_ms: 5000  # 所有 caller timeout 的最大值
+  invoke_timeout_ms: 5000  # Maximum timeout for every caller
   request_input_id: tool_request
   response_output_id: tool_response
   providers: []
@@ -94,57 +141,75 @@ tools:
   #     output_id: gateway/to_yolo
 ```
 
-Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形式的布尔值、非有限数值、空/重复 input ID 都会直接报错。旧的 `broadcast_hz` alias 仍可单独使用，但不能与 `state_broadcast_hz` 同时配置。
+Configuration validation rejects unknown/duplicate YAML keys, string-valued booleans,
+non-finite numbers and empty/duplicate input IDs. The legacy `broadcast_hz` alias remains
+supported alone, but cannot coexist with `state_broadcast_hz`.
 
-当 `readiness.require_images: true` 时，`image_input_ids` 不能为空，否则 readiness 会报告缺少 `image_input_ids`。本体状态必须携带 position、velocity 或 effort 数值，并至少匹配一个 `joint_order` 中的 joint；partial joint state 仍受支持。
+When `readiness.require_images: true`, `image_input_ids` must be nonempty or readiness reports
+it missing. Proprioceptive state must carry position, velocity or effort values and match at
+least one joint in `joint_order`; partial joint states remain supported.
 
-`tools.enabled: true` 时，Gateway 可以作为 Tool-only Dora 节点启动，不要求 `joint_order`。Gateway 是唯一 caller-visible discovery/routing authority：provider 共享输入接受 management、invoke/status/result/control response、`tool.event` 和 `tool.error`；共享输出发送 registry response 及 pinned Tool request。
+With `tools.enabled: true`, Gateway can start as a Tool-only Dora Node without `joint_order`.
+Gateway is the sole caller-visible discovery/routing authority. Shared provider inputs accept
+management, invoke/status/result/control responses, `tool.event` and `tool.error`; shared outputs
+send registry responses and pinned Tool requests.
 
-Directory 对每个 `endpoint_id` 维护一个带 monotonic lease 的 current instance，并允许 Query/Action descriptor。Query 同步行为保持不变。配置 `tools.specs` 后，Action 使用独立有界 invocation store：Gateway 生成 invocation/attempt、pin provider instance，并路由 invoke/status/result/control/event。terminal result 与事件按配置保留；lease expiry/provider replacement 的不确定结果记为 `unknown`。deadline 不等于 stop，cancel accepted 也不等于 cancelled。Gateway 不实现 retry、dedup、Session、PAOS 或 Skill Runtime。
+The Directory maintains one current instance with a monotonic lease per `endpoint_id` and accepts
+Query/Action/Session descriptors. Query retains synchronous behavior. With `tools.specs` configured,
+Actions use a separate bounded invocation store: Gateway generates invocation/attempt identities,
+pins the provider instance and routes invoke/status/result/control/event messages. Terminal results
+and events follow configured retention. Lease expiry/provider replacement makes uncertain results
+`unknown`. A deadline is not a stop, and accepted cancellation is not cancellation completion.
+Session uses start/stop/status/result; its running lifetime has no Action deadline, but the handshake
+is bounded and provider leases still apply. Gateway implements no automatic retry, general deduplication,
+PAOS or Skill Runtime.
 
-启动：
+Start:
 
 ```bash
 uv run python main.py --config gateway.yaml
 ```
 
-## 数据采集面板
+## Data collection panel
 
-启动 dataflow 后打开 <http://127.0.0.1:9001>（端口以配置为准）。Gateway 内置的零构建依赖 Web 面板提供：
+After starting the dataflow, open <http://127.0.0.1:9001> (use the configured port).
+Gateway includes a web panel requiring no frontend build:
 
-- 多路实时相机与 readiness / 连接状态；
-- 关节实测值、动作指令和 recorder 统计；
-- 带唯一输出路径与采集元数据的开始录制；
-- 停止并保留、丢弃当前 session、场景复位。
+- Multiple live cameras and readiness/connection status.
+- Measured joints, action commands and recorder statistics.
+- Start recording with a unique output path and collection metadata.
+- Stop and keep, discard the current recording session, or reset the scene.
 
-页面与 API 同源，不需要单独启动前端服务。默认仅监听 `127.0.0.1`；如果改为 `0.0.0.0`，同一网络中的客户端也能调用控制 API，部署时应自行增加可信网络隔离或认证代理。
+The page and API share an origin; no separate frontend service is required. The default bind address
+is `127.0.0.1`. Binding `0.0.0.0` also lets other clients on that network invoke control APIs;
+provide trusted-network isolation or an authenticating proxy for such deployments.
 
 ## HTTP API
 
-- `POST /record/control`，body: `{"action":"START|STOP|DISCARD","output_path":"optional.mcap","metadata":"optional object"}`
-- `POST /record/set_root`，body: `{"root":"..."}`
+- `POST /record/control`, body: `{"action":"START|STOP|DISCARD","output_path":"optional.mcap","metadata":"optional object"}`
+- `POST /record/set_root`, body: `{"root":"..."}`
 - `GET /record/status`
-- `POST /playback/control`，body: `{"action":"START|PAUSE|RESUME|RESET","mcap_path":"optional.mcap"}`
+- `POST /playback/control`, body: `{"action":"START|PAUSE|RESUME|RESET","mcap_path":"optional.mcap"}`
 - `GET /playback/status`
-- `POST /runtime/reset_scene`：发送 `reset_scene` runtime 命令，用于仿真场景复位；不同于 playback 的 `RESET`
+- `POST /runtime/reset_scene`: sends the runtime command `reset_scene` to reset a simulation scene; distinct from playback `RESET`.
 - `POST /runtime/stop`
-- `GET /tools`：列出当前 active Tool descriptor；不暴露 provider instance、route 或 monotonic lease 时间。
-- `GET /tools/{tool_id}`、`GET /tools/{tool_id}/context`：读取 ToolSpec 与 readiness/frame context。
-- `POST /tools/{tool_id}:invoke`：创建 Action invocation，返回 `202`。
-- `POST /tools/{endpoint_id}/{operation}:invoke`：调用 Query Tool，body: `{"arguments":{},"caller_id":"optional","timeout_ms":5000}`；`timeout_ms` 可省略，否则必须在 `1..tools.invoke_timeout_ms`；使用与 Dora caller 相同的 Tool Gateway service。
-- `GET /invocations/{id}`、`GET /invocations/{id}/result`、`POST /invocations/{id}/cancel`、`GET /invocations/{id}/events`：Action 状态、结果、取消和 SSE。
+- `GET /tools`: active Tool descriptors, without provider instances, routes or monotonic lease times.
+- `GET /tools/{tool_id}`, `GET /tools/{tool_id}/context`: ToolSpec and readiness/frame context.
+- `POST /tools/{tool_id}:invoke`: creates an Action or Session invocation; returns `202`.
+- `POST /tools/{endpoint_id}/{operation}:invoke`: invokes a Query; body `{"arguments":{},"caller_id":"optional","timeout_ms":5000}`. `timeout_ms` is optional; when supplied it must be in `1..tools.invoke_timeout_ms`. Uses the same Tool Gateway service as Dora callers.
+- `GET /invocations/{id}`, `GET /invocations/{id}/result`, `POST /invocations/{id}/cancel`, `POST /invocations/{id}/stop`, `GET /invocations/{id}/events`: invocation status, results, Action cancellation, Session stop and SSE.
 
-- `POST /policy/command`：直接发送 `PolicyCommand`，body: `{"command":"...","inputs":{}}`
-- `GET /runtime/status`：返回状态快照与 readiness
-- `POST /runtime/start`：仅在 readiness 满足时发送默认 `start` 命令，可用 body 覆盖 `command` 和 `inputs`
+- `POST /policy/command`: sends `PolicyCommand` directly; body `{"command":"...","inputs":{}}`.
+- `GET /runtime/status`: status snapshot and readiness.
+- `POST /runtime/start`: sends the default `start` only when ready; the body may override `command` and `inputs`.
 
 ## WebSocket
 
-- `/ws/state`：按 `state_broadcast_hz` 推送轻量 JSON 状态，包括 `proprio_state`、`action`、运行状态与 readiness。
-- `/ws/images`：按 `image_broadcast_hz` 推送每路图像的增量消息。压缩图像会直接 base64 转发；原始 `Image` 会编码为 JPEG。
-- `ws_send_timeout_sec`：单次 WebSocket 发送超时时间。连接写入停滞超过该时间会被 gateway 主动断开，避免阻塞后续广播。
+- `/ws/state`: lightweight JSON state at `state_broadcast_hz`, including `proprio_state`, `action`, runtime status and readiness.
+- `/ws/images`: per-camera incremental messages at `image_broadcast_hz`; compressed images are forwarded as base64, while raw `Image` payloads are JPEG-encoded.
+- `ws_send_timeout_sec`: per-send WebSocket timeout; a stalled connection is disconnected to avoid blocking later broadcasts.
 
-图像消息包含：
+Image messages contain:
 
 ```json
 {
@@ -158,9 +223,9 @@ uv run python main.py --config gateway.yaml
 }
 ```
 
-## Dora 输入输出
+## Dora inputs and outputs
 
-输入：
+Inputs:
 
 - `tick`
 - `proprio_state`
@@ -168,24 +233,43 @@ uv run python main.py --config gateway.yaml
 - `runtime_status`
 - `record_status`
 - `playback_status`
-- 配置中的 `image_input_ids`
-- `tools.request_input_id`：public caller 的 logical `tool.invoke.request`
-- `tools.providers[*].input_id`：provider 的 register/unregister/invoke.response/tool.error 共享输入
+- Configured `image_input_ids`.
+- `tools.request_input_id`: public caller's logical `tool.invoke.request`.
+- `tools.providers[*].input_id`: shared provider register/unregister/invoke.response/tool.error input.
 
-输出：
+Outputs:
 
 - `policy_command`
-- `tools.response_output_id`：public caller 的 correlated invoke.response/tool.error
-- `tools.providers[*].output_id`：发给 provider 的 registry.response/invoke.request 共享输出
+- `tools.response_output_id`: correlated invoke.response/tool.error for public callers.
+- `tools.providers[*].output_id`: shared registry.response/invoke.request output to providers.
 
-所有 provider/caller Tool 输入使用同一个有界有序 FIFO，不参与图像/状态的 latest-value coalescing；FIFO 满时 Gateway 显式失败，不静默丢失 registration、invoke response 或 error。Tool outbound mailbox 同样有界：management 在 Directory mutation 前保留 ACK capacity，Dora invocation 在 admission 时保留 terminal response capacity；只剩一个 slot 时返回 immediate busy error，没有 slot 时不改变状态。HTTP 与 Dora pending invocation 总数也由同一个 service `outbound_capacity` 限制；达到上限时新 invocation 返回 `FORGE_TOOL_GATEWAY_BUSY` 且不创建 pending state，已被 lifecycle claim 的 provider request 仍计入该上限。register/unregister 的 Directory effect 保留 reader `received_at` 语义；Query deadline 从 lifecycle `processed_at` 开始，并要求 provider response 在 deadline 前完成 lifecycle processing，deadline 前进入 reader FIFO 但尚未处理的 response 不会延长 deadline。
+All provider/caller Tool inputs use one bounded ordered FIFO, separate from image/state latest-value
+coalescing. Overflow fails explicitly rather than silently dropping registrations, invoke responses or
+errors. The outbound Tool mailbox is also bounded: management reserves ACK capacity before Directory
+mutation; Dora invocation reserves terminal-response capacity at admission. One remaining slot yields
+an immediate busy error; no slot means no state mutation. HTTP and Dora pending invocations share the
+service `outbound_capacity` limit. New invocations beyond that limit return `FORGE_TOOL_GATEWAY_BUSY`
+without creating pending state; lifecycle-claimed provider requests still count toward it.
+Register/unregister Directory effects preserve reader `received_at`. Query deadlines begin at lifecycle
+`processed_at` and require provider responses to complete lifecycle processing before the deadline;
+entering the reader FIFO before the deadline does not extend it.
 
-provider invoke 的 dispatch linearization point 是 lifecycle 在 `ToolGatewayService` lock 下从 mailbox claim request，并同步标记 `dispatch_claimed`。timeout/cancel/close 在 claim 前发生时，该 request 会失效且不会调用 Dora `send_output`；claim 后 Dora send 仍在 lock 外执行，因此可能继续发给 provider。所有异步 terminal completion 在 service lock 下统一仲裁：其 monotonic observation 达到或超过 pending deadline 时必须返回 `FORGE_TOOL_INVOKE_TIMEOUT`（HTTP `504`），而不是更晚发生的 provider、transport、caller-cancelled 或 closing 结果；deadline 前已完成线性化的结果保持不变。pending 已结束后的合法 provider response/error 视为 late/duplicate 并静默丢弃。该有限的 claim-after-effect 只适用于无 Gateway retry/cancel 协议的 Query，不适用于 Action 或 Session。每次 lifecycle drain 有固定上限，shutdown 会在 lifecycle thread 做一次最终 bounded caller-response drain。HTTP handler 的独立 monotonic wait 是 hard upper bound；它与 lifecycle sweep 共享同一个原子 cancellation/completion path。
+Provider invoke dispatch linearizes when the lifecycle claims the mailbox request under the
+`ToolGatewayService` lock and marks `dispatch_claimed`. Timeout/cancel/close before that point
+invalidates the request without calling Dora `send_output`; sending after a claim still occurs
+outside the lock and may reach the provider. All asynchronous terminal completions arbitrate under
+the service lock: observations at or beyond the pending monotonic deadline return
+`FORGE_TOOL_INVOKE_TIMEOUT` (HTTP `504`), rather than later provider, transport, caller-cancelled or
+closing outcomes. Results linearized before the deadline remain unchanged. Valid responses/errors
+after completion are silently discarded as late/duplicate. This bounded claim-after-effect behavior
+applies only to Query without Gateway retry/cancel protocol, not Action or Session. Lifecycle drains
+are bounded; shutdown performs a final bounded caller-response drain on the lifecycle thread.
+The HTTP handler's independent monotonic wait is a hard upper bound and shares the lifecycle sweep's
+atomic cancellation/completion path.
 
-## 开源与许可证
+## Open source and licensing
 
-本仓库自有代码、配置、静态资源和文档采用
-[Apache License 2.0](LICENSE)。运行时依赖不随源码仓库分发，并保留各自的
-许可证；详见 [NOTICE](NOTICE) 和
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。发布独立可执行文件前，
-需要对 PyInstaller 产物中的完整依赖集合另行执行许可证审查。
+Repository-owned code, configuration, static resources and documentation use
+[Apache License 2.0](LICENSE). Runtime dependencies are not distributed with this source repository
+and retain their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Review the complete dependency set in a PyInstaller artifact before publishing standalone executables.
