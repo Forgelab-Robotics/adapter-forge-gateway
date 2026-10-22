@@ -33,5 +33,6 @@ License 2.0.
 ## README capability summary
 
 Changes to Node entrypoints, Endpoint operations or Tool APIs must update the root
-README capability summary in the same change. Follow the [Node README contract](https://github.com/PhyAgentOS/forge/blob/master/CONTRIBUTING.md#node-readme-contract);
+English `README.md` and Chinese `README_zh.md` capability summaries in the same
+change; keep the files separate and add reciprocal language links. Follow the [Node README contract](https://github.com/PhyAgentOS/forge/blob/master/CONTRIBUTING.md#node-readme-contract);
 count Nodes, Endpoints, operations and deployment Tools separately.
