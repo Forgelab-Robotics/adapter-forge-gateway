@@ -29,3 +29,9 @@ changes.
 
 By submitting a contribution, you agree that it is licensed under Apache
 License 2.0.
+
+## README capability summary
+
+Changes to Node entrypoints, Endpoint operations or Tool APIs must update the root
+README capability summary in the same change. Follow the [Node README contract](https://github.com/PhyAgentOS/forge/blob/master/CONTRIBUTING.md#node-readme-contract);
+count Nodes, Endpoints, operations and deployment Tools separately.

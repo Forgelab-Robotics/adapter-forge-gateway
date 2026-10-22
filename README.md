@@ -12,6 +12,44 @@
 > 如需远程访问，必须放在可信网络和经过认证的加密反向代理之后。连接真机前，
 > 还必须独立验证急停、工作区隔离和设备安全限制。
 
+## Node、Endpoint 与 Tool API / Capability summary
+
+| 项目 | 当前实现 |
+| --- | --- |
+| 生产 Node | 1：`gateway`；源码入口 `main.py`，打包入口 `dist/gateway`；无独立 console script |
+| Tool 支持 | Gateway caller-visible discovery、ToolSpec、provider lease/路由及 Query/Action/Session 调用 |
+| 自有业务 Endpoint 数 | 0；Gateway 不实现 motion/gripper/benchmark 等业务 provider |
+| 路由 Endpoint / operation 数 | 由 `tools.providers` 配置、provider descriptor 和当前 lease 决定，没有仓库固定值 |
+| Gateway Tool 数 | 由 `tools.specs` 定义；可用性还取决于 provider 注册与 readiness，不能按 Node 或 Endpoint 数推算 |
+| 直接 HTTP Tool API | 10 个 Tool/Invocation 路由模板，见下表；不含其他 runtime/record/playback/WebSocket 接口 |
+
+| 方法 | 路由模板 | 用途 |
+| --- | --- | --- |
+| GET | `/tools` | Tool 目录/发现 |
+| GET | `/tools/{tool_id}` | ToolSpec |
+| GET | `/tools/{tool_id}/context` | readiness 和 frame context |
+| POST | `/tools/{tool_id}:invoke` | Action 或 Session 创建调用 |
+| POST | `/tools/{endpoint_id}/{operation}:invoke` | Query 调用 |
+| GET | `/invocations/{invocation_id}` | 状态 |
+| GET | `/invocations/{invocation_id}/result` | 结果 |
+| POST | `/invocations/{invocation_id}/cancel` | Action 取消 |
+| POST | `/invocations/{invocation_id}/stop` | Session 停止 |
+| GET | `/invocations/{invocation_id}/events` | SSE 事件 |
+
+例如 robot-control-sim 的路由链为：
+`sim.set_gripper_opening -> gripper.controller / set_opening -> gripper_action_policy`。
+ToolSpec 选择业务操作，provider route 决定 Dora 通道；Node ID、Endpoint ID 与 Tool ID 是不同身份。
+
+当前源码支持 Query、Action、Session；Session start/stop/status/result 与 Action cancel 分别处理。
+这不证明某个历史 Release 或 Skill 锁定的二进制具备同等能力。核对部署版本后再使用对应接口。
+实现：[HTTP routes](src/forge_gateway/controllers/tool_controller.py)、
+[Tool service](src/forge_gateway/services/tool_gateway_service.py)、
+[Session lifecycle tests](tests/test_tool_session.py)。
+
+兼容性：当前依赖声明为 `dora-rs==0.4.1`、`forge-msgs==1.3.0`、`forge-common>=1.0.0,<2`；以 [pyproject.toml](pyproject.toml) 与 [uv.lock](uv.lock) 为准。 Tool 协议实现为仓库内 vendored 代码。 这些声明不构成跨版本互操作保证；使用制品时还需核对 build revision 和 Skill lock。
+
+后续修改 Node 入口、Endpoint 或 Tool API 时，请同步更新本节及对应配置/契约，遵循 [Node README 规范](https://github.com/PhyAgentOS/forge/blob/master/CONTRIBUTING.md#node-readme-contract)。
+
 ## 独立开发
 
 项目固定使用 Python `3.12`，依赖与开发/构建工具均由 `uv` 管理。
@@ -33,7 +71,7 @@ uv run pytest -q
 ```bash
 uv run python main.py --config config.example.yaml
 uv run python main.py --help
-uv run python main.py --version  # forge-gateway 1.0.2
+uv run python main.py --version
 ```
 
 这是一个直接从 checkout 运行的节点项目，不构建或发布 wheel/sdist，也不安装 console script。`pyproject.toml` 和 `uv.lock` 仅用于管理 Python 与依赖；根目录的 `main.py` 是节点入口，`config.py` 保留历史源码导入兼容。依赖通过公开索引锁定；尚未独立发布的 Apache-2.0 `forge-tool` 协议实现随源码仓库提供，以保证公开 checkout 可复现运行。普通 `pip install .` 不属于受支持的部署路径。
@@ -100,7 +138,7 @@ Gateway 对配置执行严格校验：未知或重复的 YAML key、字符串形
 
 `tools.enabled: true` 时，Gateway 可以作为 Tool-only Dora 节点启动，不要求 `joint_order`。Gateway 是唯一 caller-visible discovery/routing authority：provider 共享输入接受 management、invoke/status/result/control response、`tool.event` 和 `tool.error`；共享输出发送 registry response 及 pinned Tool request。
 
-Directory 对每个 `endpoint_id` 维护一个带 monotonic lease 的 current instance，并允许 Query/Action descriptor。Query 同步行为保持不变。配置 `tools.specs` 后，Action 使用独立有界 invocation store：Gateway 生成 invocation/attempt、pin provider instance，并路由 invoke/status/result/control/event。terminal result 与事件按配置保留；lease expiry/provider replacement 的不确定结果记为 `unknown`。deadline 不等于 stop，cancel accepted 也不等于 cancelled。Gateway 不实现 retry、dedup、Session、PAOS 或 Skill Runtime。
+Directory 对每个 `endpoint_id` 维护一个带 monotonic lease 的 current instance，并允许 Query/Action/Session descriptor。Query 同步行为保持不变。配置 `tools.specs` 后，Action 使用独立有界 invocation store：Gateway 生成 invocation/attempt、pin provider instance，并路由 invoke/status/result/control/event。terminal result 与事件按配置保留；lease expiry/provider replacement 的不确定结果记为 `unknown`。deadline 不等于 stop，cancel accepted 也不等于 cancelled。Session 使用 start/stop/status/result，运行期不受 Action deadline 限制，但握手有界且 provider lease 仍有效。Gateway 不实现自动 retry、通用 dedup、PAOS 或 Skill Runtime。
 
 启动：
 
@@ -130,9 +168,9 @@ uv run python main.py --config gateway.yaml
 - `POST /runtime/stop`
 - `GET /tools`：列出当前 active Tool descriptor；不暴露 provider instance、route 或 monotonic lease 时间。
 - `GET /tools/{tool_id}`、`GET /tools/{tool_id}/context`：读取 ToolSpec 与 readiness/frame context。
-- `POST /tools/{tool_id}:invoke`：创建 Action invocation，返回 `202`。
+- `POST /tools/{tool_id}:invoke`：创建 Action 或 Session invocation，返回 `202`。
 - `POST /tools/{endpoint_id}/{operation}:invoke`：调用 Query Tool，body: `{"arguments":{},"caller_id":"optional","timeout_ms":5000}`；`timeout_ms` 可省略，否则必须在 `1..tools.invoke_timeout_ms`；使用与 Dora caller 相同的 Tool Gateway service。
-- `GET /invocations/{id}`、`GET /invocations/{id}/result`、`POST /invocations/{id}/cancel`、`GET /invocations/{id}/events`：Action 状态、结果、取消和 SSE。
+- `GET /invocations/{id}`、`GET /invocations/{id}/result`、`POST /invocations/{id}/cancel`、`POST /invocations/{id}/stop`、`GET /invocations/{id}/events`：调用状态、结果、Action 取消、Session 停止和 SSE。
 
 - `POST /policy/command`：直接发送 `PolicyCommand`，body: `{"command":"...","inputs":{}}`
 - `GET /runtime/status`：返回状态快照与 readiness
